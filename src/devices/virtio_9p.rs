@@ -3,8 +3,10 @@
 //! Implements 9P2000.L protocol over VirtIO transport for filesystem access.
 //! This allows the guest to access a filesystem provided by the host (browser).
 
-use super::virtio::{VirtioMmio, Virtqueue};
-use std::collections::HashMap;
+use super::virtio::{VirtioMmio, Virtqueue, Descriptor};
+use std::collections::{HashMap, VecDeque, HashSet};
+use crate::memory::Memory;
+use serde::{Serialize, Deserialize};
 
 // 9P2000.L message types
 const P9_TLERROR: u8 = 6;
@@ -87,7 +89,7 @@ const ENOSPC: u32 = 28;
 const ENOTEMPTY: u32 = 39;
 
 /// A 9P QID (unique identifier for a file)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Qid {
     pub qtype: u8,
     pub version: u32,
@@ -109,7 +111,7 @@ impl Qid {
 }
 
 /// Inode representing a file or directory
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Inode {
     pub qid: Qid,
     pub name: String,
@@ -128,7 +130,7 @@ pub struct Inode {
     pub parent: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum InodeContent {
     /// Content stored inline (for small files)
     Inline(Vec<u8>),
@@ -155,7 +157,7 @@ impl Inode {
 }
 
 /// 9P Fid - represents an open file handle
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Fid {
     pub inode_path: u64,
     pub open: bool,
@@ -164,6 +166,7 @@ pub struct Fid {
 }
 
 /// VirtIO-9p device
+#[derive(Serialize, Deserialize)]
 pub struct Virtio9p {
     /// VirtIO MMIO base
     pub virtio: VirtioMmio,
@@ -180,7 +183,22 @@ pub struct Virtio9p {
     /// Pending requests
     pub pending_requests: Vec<Vec<u8>>,
     /// Pending responses
-    pub pending_responses: Vec<Vec<u8>>,
+    /// Pending responses
+    pub pending_responses: VecDeque<Vec<u8>>,
+    
+    // Lazy loading
+    pub blob_cache: HashMap<String, Vec<u8>>,
+    pub missing_blobs: HashSet<String>,
+    pub suspended_requests: Vec<SuspendedRequest>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SuspendedRequest {
+    pub queue_idx: usize,
+    pub head_idx: u16,
+    pub output_descriptors: Vec<Descriptor>,
+    pub tag: u16,
+    pub input_buffer: Vec<u8>,
 }
 
 impl Virtio9p {
@@ -210,7 +228,10 @@ impl Virtio9p {
             fids: HashMap::new(),
             msize: 8192,
             pending_requests: Vec::new(),
-            pending_responses: Vec::new(),
+            pending_responses: VecDeque::new(),
+            blob_cache: HashMap::new(),
+            missing_blobs: HashSet::new(),
+            suspended_requests: Vec::new(),
         };
         
         // Create root inode
@@ -250,34 +271,154 @@ impl Virtio9p {
         self.virtio.write32(offset, value);
     }
     
-    /// Handle a queue notification (guest wrote to QUEUE_NOTIFY)
-    pub fn notify(&mut self, queue: u32) {
-        // Queue notification - process pending descriptors
-        // This will be called by the System when it detects a write to QUEUE_NOTIFY
-    }
-    
-    /// Process a 9P request message and return a response
-    pub fn process_message(&mut self, request: &[u8]) -> Vec<u8> {
-        if request.len() < 7 {
-            return self.error_response(0, EINVAL);
+    /// Process pending queues
+    pub fn process_queues(&mut self, mem: &mut Memory) {
+        // Collect pending queues to avoid borrow issues if we iterated queue_notify_pending directly?
+        // Actually .pop_front() removes item, so we don't hold borrow on vector.
+        // But we need to borrow `self.virtio` to pop.
+        let mut queues_to_process = Vec::new();
+        while let Some(q) = self.virtio.queue_notify_pending.pop_front() {
+            queues_to_process.push(q);
         }
         
-        let size = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
+        // Ensure we process each queue only once per batch (deduplicate)
+        queues_to_process.sort_unstable();
+        queues_to_process.dedup();
+        
+        for queue_idx in queues_to_process {
+            self.process_queue(mem, queue_idx as usize);
+        }
+    }
+
+    fn process_queue(&mut self, mem: &mut Memory, queue_idx: usize) {
+        let mut processed_any = false;
+        
+        loop {
+            // STEP 1: Borrow queue to check availability and read input
+            // We use a block to limit the borrow scope of `self.virtio`
+            let (head_idx, input_buffer, output_descriptors) = {
+                let queue = if let Some(q) = self.virtio.queues.get_mut(queue_idx) {
+                    q
+                } else {
+                    return;
+                };
+                
+                if !queue.ready {
+                    return;
+                }
+                
+                let avail_idx = queue.avail_idx(mem);
+                if queue.last_avail_idx == avail_idx {
+                    break;
+                }
+                
+                let head_idx = queue.get_avail_head(mem, queue.last_avail_idx);
+                queue.last_avail_idx = queue.last_avail_idx.wrapping_add(1);
+                
+                let mut desc_idx = head_idx;
+                let mut input = Vec::new();
+                let mut output = Vec::new();
+                
+                loop {
+                    let desc = queue.read_desc(mem, desc_idx);
+                    if (desc.flags & super::virtio::VRING_DESC_F_WRITE) == 0 {
+                         for i in 0..desc.len {
+                             input.push(mem.read8((desc.addr + i as u64) as u32));
+                         }
+                    } else {
+                        output.push(desc);
+                    }
+                    
+                    if (desc.flags & super::virtio::VRING_DESC_F_NEXT) == 0 {
+                        break;
+                    }
+                    desc_idx = desc.next;
+                }
+                (head_idx, input, output)
+            };
+            
+            // STEP 2: Process message (No borrow of virtio here, only self methods that use other fields)
+            let result = self.process_message(&input_buffer);
+            
+            match result {
+                Some(response) => {
+                    // STEP 3: Write response and update used ring
+                    {
+                        // Re-borrow queue from self.virtio
+                        let queue = &mut self.virtio.queues[queue_idx];
+                        
+                        let mut bytes_written = 0;
+                        let mut resp_offset = 0;
+                        
+                        for desc in output_descriptors {
+                            if resp_offset >= response.len() { break; }
+                            let to_write = std::cmp::min(desc.len as usize, response.len() - resp_offset);
+                            
+                            for i in 0..to_write {
+                                mem.write32(desc.addr as u32 + i as u32, response[resp_offset + i] as u32);
+                                mem.write8((desc.addr + i as u64) as u32, response[resp_offset + i]);
+                            }
+                            resp_offset += to_write;
+                            bytes_written += to_write;
+                        }
+                        
+                        queue.push_used(mem, head_idx as u32, bytes_written as u32);
+                    }
+                    processed_any = true;
+                },
+                None => {
+                    // Suspended request (waiting for lazy load)
+                    // We need to extract the tag from the input buffer to identify the request later?
+                    // 9P header: size[4] type[1] tag[2]
+                    let tag = if input_buffer.len() >= 7 {
+                        u16::from_le_bytes([input_buffer[5], input_buffer[6]])
+                    } else {
+                        0xFFFF // Should not happen for valid requests
+                    };
+                    
+                    self.suspended_requests.push(SuspendedRequest {
+                        queue_idx,
+                        head_idx,
+                        output_descriptors,
+                        tag,
+                        input_buffer: input_buffer.to_vec(),
+                    });
+                    
+                    // We do NOT push to used ring yet.
+                    // Interrupt is optional here? Usually not raised until completion.
+                }
+            }
+        }
+        
+        if processed_any {
+            self.virtio.raise_interrupt(true);
+        }
+    }
+    
+    // Kept for compatibility if interface requires it, but empty
+    pub fn notify(&mut self, _queue: u32) {}
+    
+    /// Process a 9P request message and return a response
+    pub fn process_message(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+        if request.len() < 7 {
+            return Some(self.error_response(0, EINVAL));
+        }
+        
         let msg_type = request[4];
         let tag = u16::from_le_bytes([request[5], request[6]]);
         let payload = &request[7..];
         
         match msg_type {
-            P9_TVERSION => self.handle_version(tag, payload),
-            P9_TATTACH => self.handle_attach(tag, payload),
-            P9_TWALK => self.handle_walk(tag, payload),
-            P9_TCLUNK => self.handle_clunk(tag, payload),
-            P9_TGETATTR => self.handle_getattr(tag, payload),
-            P9_TREADDIR => self.handle_readdir(tag, payload),
-            P9_TLOPEN => self.handle_lopen(tag, payload),
-            P9_TREAD => self.handle_read(tag, payload),
-            P9_TSTATFS => self.handle_statfs(tag, payload),
-            _ => self.error_response(tag, EINVAL),
+            P9_TVERSION => Some(self.handle_version(tag, payload)),
+            P9_TATTACH => Some(self.handle_attach(tag, payload)),
+            P9_TWALK => Some(self.handle_walk(tag, payload)),
+            P9_TCLUNK => Some(self.handle_clunk(tag, payload)),
+            P9_TGETATTR => Some(self.handle_getattr(tag, payload)),
+            P9_TREADDIR => Some(self.handle_readdir(tag, payload)),
+            P9_TLOPEN => Some(self.handle_lopen(tag, payload)),
+            P9_TREAD => self.handle_read(tag, payload), // Returns Option
+            P9_TSTATFS => Some(self.handle_statfs(tag, payload)),
+            _ => Some(self.error_response(tag, EINVAL)),
         }
     }
     
@@ -661,9 +802,59 @@ impl Virtio9p {
         resp
     }
     
-    fn handle_read(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
+    pub fn get_missing_blobs(&self) -> Vec<String> {
+        self.missing_blobs.iter().cloned().collect()
+    }
+    
+    pub fn provide_blob(&mut self, hash: String, data: Vec<u8>, mem: &mut Memory) {
+        self.blob_cache.insert(hash.clone(), data);
+        self.missing_blobs.remove(&hash);
+        
+        // Retry suspended requests
+        // Take ownership of requests to avoid borrowing self
+        let requests = std::mem::replace(&mut self.suspended_requests, Vec::new());
+        let mut still_suspended = Vec::new();
+        let mut processing_occurred = false;
+        
+        for req in requests {
+            if let Some(response) = self.process_message(&req.input_buffer) {
+                // Completed! Write back
+                {
+                     let queue = &mut self.virtio.queues[req.queue_idx];
+                     let mut bytes_written = 0;
+                     let mut resp_offset = 0;
+                     
+                     for desc in &req.output_descriptors {
+                         if resp_offset >= response.len() { break; }
+                         let to_write = std::cmp::min(desc.len as usize, response.len() - resp_offset);
+                         
+                         for k in 0..to_write {
+                             mem.write32(desc.addr as u32 + k as u32, response[resp_offset + k] as u32);
+                             mem.write8((desc.addr + k as u64) as u32, response[resp_offset + k]);
+                         }
+                         resp_offset += to_write;
+                         bytes_written += to_write;
+                     }
+                     
+                     queue.push_used(mem, req.head_idx as u32, bytes_written as u32);
+                }
+                processing_occurred = true;
+            } else {
+                still_suspended.push(req);
+            }
+        }
+        
+        // Put back still suspended requests
+        self.suspended_requests.extend(still_suspended);
+        
+        if processing_occurred {
+             self.virtio.raise_interrupt(true);
+        }
+    }
+    
+    fn handle_read(&mut self, tag: u16, payload: &[u8]) -> Option<Vec<u8>> {
         if payload.len() < 16 {
-            return self.error_response(tag, EINVAL);
+            return Some(self.error_response(tag, EINVAL));
         }
         
         let fid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -675,12 +866,12 @@ impl Virtio9p {
         
         let f = match self.fids.get(&fid) {
             Some(f) => f,
-            None => return self.error_response(tag, EBADF),
+            None => return Some(self.error_response(tag, EBADF)),
         };
         
         let inode = match self.inodes.get(&f.inode_path) {
-            Some(i) => i,
-            None => return self.error_response(tag, ENOENT),
+            Some(i) => i.clone(),
+            None => return Some(self.error_response(tag, ENOENT)),
         };
         
         // Get data based on content type
@@ -694,9 +885,21 @@ impl Virtio9p {
                     data[start..end].to_vec()
                 }
             }
-            InodeContent::Hash(_hash) => {
-                // TODO: Lazy load from server
-                Vec::new()
+            InodeContent::Hash(hash) => {
+                if let Some(blob) = self.blob_cache.get(hash) {
+                    let start = offset as usize;
+                    let end = (offset as usize + count as usize).min(blob.len());
+                    if start >= blob.len() {
+                        Vec::new()
+                    } else {
+                        blob[start..end].to_vec()
+                    }
+                } else {
+                    // Blob missing, trigger load
+                    self.missing_blobs.insert(hash.clone());
+                    // Return None to suspend request
+                    return None;
+                }
             }
             InodeContent::Symlink(target) => {
                 let bytes = target.as_bytes();
@@ -709,7 +912,7 @@ impl Virtio9p {
                 }
             }
             InodeContent::Directory => {
-                return self.error_response(tag, EISDIR);
+                return Some(self.error_response(tag, EISDIR));
             }
         };
         
@@ -722,7 +925,7 @@ impl Virtio9p {
         
         let size = resp.len() as u32;
         resp[0..4].copy_from_slice(&size.to_le_bytes());
-        resp
+        Some(resp)
     }
     
     fn handle_statfs(&mut self, tag: u16, payload: &[u8]) -> Vec<u8> {
@@ -809,9 +1012,97 @@ impl Virtio9p {
     pub fn reset(&mut self) {
         self.virtio.reset();
         self.fids.clear();
+        self.blob_cache.clear();
+        self.missing_blobs.clear();
+        self.suspended_requests.clear();
     }
     
     pub fn has_interrupt(&self) -> bool {
         self.virtio.interrupt_pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_version_negotiation() {
+        let mut device = Virtio9p::new("test");
+        
+        // P9_TVERSION: size[4] Tversion[1] tag[2] msize[4] version[s]
+        // version string: "9P2000.L" (8 bytes)
+        // total size: 4 + 1 + 2 + 4 + 2 + 8 = 21
+        let mut request = Vec::new();
+        request.extend_from_slice(&(21u32).to_le_bytes()); // size
+        request.push(P9_TVERSION); // type
+        request.extend_from_slice(&(0u16).to_le_bytes()); // tag
+        request.extend_from_slice(&(8192u32).to_le_bytes()); // msize
+        request.extend_from_slice(&(8u16).to_le_bytes()); // version len
+        request.extend_from_slice(b"9P2000.L"); // version string
+        
+        let response = device.process_message(&request);
+        
+        assert!(response.is_some());
+        let response = response.unwrap();
+        
+        let resp_size = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+        assert_eq!(resp_size as usize, response.len());
+        assert_eq!(response[4], P9_RVERSION);
+    }
+    
+    #[test]
+    fn test_lazy_read() {
+        let mut device = Virtio9p::new("test");
+        let root = 1; // Root inode is always 1
+        
+        // Add a lazy file
+        let file_inode = device.add_file(root, "lazy.txt", InodeContent::Hash("hash123".to_string()), 0o100644);
+        
+        // Open the file (simulated, we need a valid FID)
+        let fid = 100;
+        device.fids.insert(fid, Fid {
+            inode_path: file_inode,
+            open: true,
+            open_flags: 0,
+            position: 0,
+        });
+        
+        // Construct TREAD request
+        // P9_TREAD: size[4] Tread[1] tag[2] fid[4] offset[8] count[4]
+        // size = 4+1+2+4+8+4 = 23
+        let mut request = Vec::new();
+        let tag = 1;
+        request.extend_from_slice(&(23u32).to_le_bytes()); 
+        request.push(P9_TREAD);
+        request.extend_from_slice(&(tag as u16).to_le_bytes());
+        request.extend_from_slice(&(fid as u32).to_le_bytes());
+        request.extend_from_slice(&(0u64).to_le_bytes()); // offset
+        request.extend_from_slice(&(100u32).to_le_bytes()); // count
+        
+        // 1. Initial read should be pending (return None)
+        let response = device.process_message(&request);
+        assert!(response.is_none());
+        
+        // Check missing blobs
+        assert!(device.missing_blobs.contains("hash123"));
+        
+        // 2. Provide blob (simulating cache update directly to avoid full memory mock)
+        device.blob_cache.insert("hash123".to_string(), b"Hello Lazy".to_vec());
+        device.missing_blobs.remove("hash123");
+        
+        // 3. Retry read (should succeed)
+        let response = device.process_message(&request);
+        assert!(response.is_some());
+        let data = response.unwrap();
+        
+        // Check response type is RREAD
+        assert_eq!(data[4], P9_RREAD);
+        // Check data content (header: size[4] id[1] tag[2] count[4] data[...])
+        // count is at offset 7
+        let count = u32::from_le_bytes([data[7], data[8], data[9], data[10]]);
+        assert_eq!(count, 10);
+        let content = &data[11..];
+        assert_eq!(content, b"Hello Lazy");
     }
 }

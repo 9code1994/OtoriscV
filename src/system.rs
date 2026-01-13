@@ -6,6 +6,7 @@ use crate::cpu::Cpu;
 use crate::cpu::csr::*;
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
+use serde::{Serialize, Deserialize};
 
 // Device base addresses (matching jor1k)
 const CLINT_BASE: u32 = 0x0200_0000;
@@ -22,9 +23,10 @@ const VIRTIO_SIZE: u32 = 0x0000_1000;
 // UART interrupt line on PLIC
 const UART_IRQ: u32 = 10;
 
-/// System state  
+/// System state
+#[derive(Serialize, Deserialize)]
 pub struct System {
-    cpu: Cpu,
+    pub cpu: Cpu,
     memory: Memory,
     
     // Direct device references (since we can't easily downcast)
@@ -57,6 +59,35 @@ impl System {
     /// Load a binary at the specified address
     pub fn load_binary(&mut self, data: &[u8], addr: u32) -> Result<(), String> {
         self.memory.load_binary(data, addr)
+    }
+
+    /// Setup system for Linux booting
+    /// Loads kernel image and generates/loads DTB
+    pub fn setup_linux_boot(&mut self, kernel: &[u8], cmdline: &str) -> Result<(), String> {
+        // Load kernel at DRAM_BASE (0x80000000)
+        self.load_binary(kernel, DRAM_BASE)?;
+        
+        // Generate DTB
+        let ram_size = self.memory.ram_size();
+        let ram_size_mb = (ram_size / 1024 / 1024) as u32;
+        let dtb = crate::devices::dtb::generate_fdt(ram_size_mb, cmdline);
+        
+        // Load DTB at end of RAM (aligned to 4KB)
+        let dtb_addr = DRAM_BASE + ram_size as u32 - dtb.len() as u32;
+        let dtb_addr = dtb_addr & !0xFFF; // Align down
+        
+        self.load_binary(&dtb, dtb_addr)?;
+        
+        // Setup CPU State for Linux boot
+        // PC = Kernel start (0x80000000)
+        // a0 (x10) = hartid (0)
+        // a1 (x11) = dtb address
+        self.cpu.reset();
+        self.cpu.pc = DRAM_BASE;
+        self.cpu.write_reg(10, 0);       // a0
+        self.cpu.write_reg(11, dtb_addr); // a1
+        
+        Ok(())
     }
     
     /// Run the emulator for a specified number of cycles
@@ -109,10 +140,18 @@ impl System {
             virtio9p: &mut self.virtio9p,
         };
         
-        self.cpu.step(&mut bus)
+        let result = self.cpu.step(&mut bus);
+        
+        // Handle VirtIO queues
+        // We drop 'bus' here so we can borrow 'virtio9p' and 'memory' separately
+        // (Borrow checker: bus holds mutable refs to fields, so bus must die before we use them again)
+        drop(bus);
+        
+        self.virtio9p.process_queues(&mut self.memory);
+        
+        result
     }
-    
-    // ... rest of file ...
+
     /// Update interrupt pending bits from devices
     fn update_interrupts(&mut self) {
         // CLINT interrupts
@@ -199,6 +238,16 @@ impl System {
         self.clint.reset();
         self.plic.reset();
         self.virtio9p.reset();
+    }
+    
+    /// Get missing blobs for lazy loading
+    pub fn get_missing_blobs(&self) -> Vec<String> {
+        self.virtio9p.get_missing_blobs()
+    }
+    
+    /// Provide a blob for lazy loading
+    pub fn provide_blob(&mut self, hash: String, data: Vec<u8>) {
+        self.virtio9p.provide_blob(hash, data, &mut self.memory);
     }
 }
 
@@ -323,5 +372,36 @@ impl<'a> Bus for SystemBus<'a> {
         }
         // Default to memory
         self.memory.write32(addr, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::DRAM_BASE;
+
+    #[test]
+    fn test_setup_linux_boot() {
+        let mut sys = System::new(16).unwrap(); // 16MB RAM
+        let dummy_kernel = vec![0x13, 0x00, 0x00, 0x00]; // NOP
+        
+        // Should succeed
+        sys.setup_linux_boot(&dummy_kernel, "console=ttyS0").unwrap();
+        
+        // registers should be set
+        assert_eq!(sys.cpu.pc, DRAM_BASE);
+        assert_eq!(sys.cpu.read_reg(10), 0); // a0
+        
+        // DTB should be at end of RAM (aligned)
+        let dtb_addr = sys.cpu.read_reg(11); // a1
+        assert!(dtb_addr > DRAM_BASE);
+        assert!(dtb_addr < DRAM_BASE + 16 * 1024 * 1024);
+        assert_eq!(dtb_addr & 0xFFF, 0); // Aligned
+        
+        // Check DTB magic (FDT is big-endian, so we read bytes or swap)
+        // 0xd00dfeed stored as [d0, 0d, fe, ed]
+        // read32 (LE) reads as 0xedfe0dd0
+        let magic_val = sys.memory.read32(dtb_addr);
+        assert_eq!(magic_val.to_be(), 0xd00dfeed);
     }
 }

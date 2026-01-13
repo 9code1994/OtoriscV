@@ -8,7 +8,10 @@ const MSIP_BASE: u32 = 0x0000;       // Machine Software Interrupt Pending
 const MTIMECMP_BASE: u32 = 0x4000;   // Machine Timer Compare
 const MTIME_BASE: u32 = 0xBFF8;      // Machine Timer
 
+use serde::{Serialize, Deserialize};
+
 /// CLINT device
+#[derive(Serialize, Deserialize)]
 pub struct Clint {
     /// Machine Software Interrupt Pending (per hart, we support 1)
     msip: u32,

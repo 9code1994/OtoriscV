@@ -3,6 +3,7 @@
 //! Based on jor1k's uart.js implementation
 
 use std::collections::VecDeque;
+use serde::{Serialize, Deserialize};
 
 // UART registers (offset from base)
 const UART_RBR: u32 = 0; // Receive Buffer Register (read)
@@ -32,6 +33,7 @@ const IIR_RX_AVAILABLE: u8 = 0x04;
 const IIR_FIFO_ENABLED: u8 = 0xC0;
 
 /// UART 16550 device
+#[derive(Serialize, Deserialize)]
 pub struct Uart {
     /// Receive FIFO
     rx_fifo: VecDeque<u8>,

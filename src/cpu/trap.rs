@@ -91,6 +91,24 @@ impl Trap {
     pub fn is_interrupt(&self) -> bool {
         (self.code() & 0x80000000) != 0
     }
+    
+    /// Create trap from cause code and value
+    pub fn from_cause(cause: u32, tval: u32) -> Self {
+        match cause {
+            0 => Trap::InstructionAddressMisaligned(tval),
+            1 => Trap::InstructionAccessFault(tval),
+            2 => Trap::IllegalInstruction(tval),
+            3 => Trap::Breakpoint(tval),
+            4 => Trap::LoadAddressMisaligned(tval),
+            5 => Trap::LoadAccessFault(tval),
+            6 => Trap::StoreAddressMisaligned(tval),
+            7 => Trap::StoreAccessFault(tval),
+            12 => Trap::InstructionPageFault(tval),
+            13 => Trap::LoadPageFault(tval),
+            15 => Trap::StorePageFault(tval),
+            _ => Trap::IllegalInstruction(tval), // Fallback
+        }
+    }
 }
 
 /// Check for pending interrupts

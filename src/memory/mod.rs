@@ -9,6 +9,7 @@
 //! 0x80000000 - ...:        RAM (DRAM_BASE)
 
 use std::sync::Arc;
+use serde::{Serialize, Deserialize};
 
 /// Trait for memory-mapped devices
 pub trait Device: Send + Sync {
@@ -48,6 +49,7 @@ struct DeviceMapping {
 }
 
 /// Memory subsystem with RAM and device mappings
+#[derive(Serialize, Deserialize)]
 pub struct Memory {
     /// Main RAM (starts at DRAM_BASE)
     ram: Vec<u8>,
@@ -57,9 +59,11 @@ pub struct Memory {
     rom: Vec<u8>,
     
     /// Device mappings
+    #[serde(skip)]
     mappings: Vec<DeviceMapping>,
     
     /// Actual devices (stored separately for mutability)
+    #[serde(skip)]
     devices: Vec<Box<dyn Device>>,
 }
 
@@ -115,6 +119,11 @@ impl Memory {
             mappings: Vec::new(),
             devices: Vec::new(),
         }
+    }
+    
+    /// Get RAM size in bytes
+    pub fn ram_size(&self) -> usize {
+        self.ram.len()
     }
     
     /// Add a device at the specified address range

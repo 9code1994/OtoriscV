@@ -3,6 +3,7 @@
 //! Based on jor1k's safecpu.js CSR implementation
 
 use super::PrivilegeLevel;
+use serde::{Serialize, Deserialize};
 
 // CSR addresses
 pub const CSR_FFLAGS: u32 = 0x001;
@@ -72,6 +73,7 @@ pub const MIP_SEIP: u32 = 1 << 9;  // Supervisor external interrupt
 pub const MIP_MEIP: u32 = 1 << 11; // Machine external interrupt
 
 /// CSR storage
+#[derive(Serialize, Deserialize)]
 pub struct Csr {
     /// MSTATUS register
     pub mstatus: u32,

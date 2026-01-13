@@ -4,6 +4,8 @@
 //! Based on VirtIO 1.0 specification.
 
 use std::collections::VecDeque;
+use crate::memory::Memory;
+use serde::{Serialize, Deserialize};
 
 // VirtIO MMIO register offsets
 const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x000;
@@ -48,11 +50,21 @@ const VIRTIO_STATUS_DEVICE_NEEDS_RESET: u32 = 64;
 const VIRTIO_STATUS_FAILED: u32 = 128;
 
 // Virtqueue descriptor flags
-const VRING_DESC_F_NEXT: u16 = 1;
-const VRING_DESC_F_WRITE: u16 = 2;
-const VRING_DESC_F_INDIRECT: u16 = 4;
+pub const VRING_DESC_F_NEXT: u16 = 1;
+pub const VRING_DESC_F_WRITE: u16 = 2;
+pub const VRING_DESC_F_INDIRECT: u16 = 4;
+
+/// Virtqueue descriptor
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Descriptor {
+    pub addr: u64,
+    pub len: u32,
+    pub flags: u16,
+    pub next: u16,
+}
 
 /// A single virtqueue
+#[derive(Serialize, Deserialize)]
 pub struct Virtqueue {
     /// Maximum queue size
     pub num_max: u32,
@@ -91,9 +103,69 @@ impl Virtqueue {
         self.used_addr = 0;
         self.last_avail_idx = 0;
     }
+
+    /// Read a descriptor from memory
+    pub fn read_desc(&self, mem: &Memory, idx: u16) -> Descriptor {
+        let addr = self.desc_addr + (idx as u64) * 16;
+        let addr_low = (addr & 0xFFFFFFFF) as u32; // Assuming 32-bit address space for now? 
+        // Wait, VirtIO 1.0 uses 64-bit addresses. Memory read is 32-bit addr.
+        // If we are RV32, physical addresses are 32-bit (mostly).
+        // Let's assume low 32 bits for now or cast? Memory::read32 takes u32.
+        // If addr > 4GB, we can't read it with current memory model anyway.
+        
+        let a = addr_low;
+        let d_addr_low = mem.read32(a);
+        let d_addr_high = mem.read32(a + 4);
+        let d_len = mem.read32(a + 8);
+        let d_flags = mem.read16(a + 12);
+        let d_next = mem.read16(a + 14);
+        
+        Descriptor {
+            addr: (d_addr_low as u64) | ((d_addr_high as u64) << 32),
+            len: d_len,
+            flags: d_flags,
+            next: d_next,
+        }
+    }
+
+    /// Check for available buffers
+    pub fn avail_idx(&self, mem: &Memory) -> u16 {
+        // avail->idx is at offset 2 in the available ring
+        let addr = self.avail_addr + 2;
+        mem.read16(addr as u32)
+    }
+
+    /// Get descriptor index from available ring
+    pub fn get_avail_head(&self, mem: &Memory, idx: u16) -> u16 {
+        // Ring array starts at offset 4
+        // index = idx % num
+        let offset = 4 + (idx as u64 % self.num as u64) * 2;
+        let addr = self.avail_addr + offset;
+        mem.read16(addr as u32)
+    }
+    
+    /// Write to used ring
+    pub fn push_used(&mut self, mem: &mut Memory, desc_idx: u32, len: u32) {
+        // used->idx is at offset 2
+        let idx_addr = self.used_addr + 2;
+        let idx = mem.read16(idx_addr as u32);
+        
+        // Write used element
+        // Ring starts at offset 4
+        // Each element is 8 bytes: id (32), len (32)
+        let offset = 4 + (idx as u64 % self.num as u64) * 8;
+        let addr = self.used_addr + offset;
+        
+        mem.write32(addr as u32, desc_idx);
+        mem.write32((addr + 4) as u32, len);
+        
+        // Increment index
+        mem.write16(idx_addr as u32, idx.wrapping_add(1));
+    }
 }
 
 /// VirtIO MMIO device base
+#[derive(Serialize, Deserialize)]
 pub struct VirtioMmio {
     /// Device type ID
     pub device_id: u32,
@@ -121,6 +193,8 @@ pub struct VirtioMmio {
     pub config_generation: u32,
     /// Interrupt pending
     pub interrupt_pending: bool,
+    /// Pending queue notifications (indices)
+    pub queue_notify_pending: VecDeque<u32>,
 }
 
 impl VirtioMmio {
@@ -144,6 +218,7 @@ impl VirtioMmio {
             config,
             config_generation: 0,
             interrupt_pending: false,
+            queue_notify_pending: VecDeque::new(),
         }
     }
     
@@ -222,6 +297,9 @@ impl VirtioMmio {
                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
                     q.ready = value != 0;
                 }
+            }
+            VIRTIO_MMIO_QUEUE_NOTIFY => {
+                self.queue_notify_pending.push_back(value);
             }
             VIRTIO_MMIO_QUEUE_DESC_LOW => {
                 if let Some(q) = self.queues.get_mut(self.queue_sel as usize) {
@@ -306,6 +384,7 @@ impl VirtioMmio {
             q.reset();
         }
         self.interrupt_pending = false;
+        self.queue_notify_pending.clear();
     }
     
     /// Raise an interrupt

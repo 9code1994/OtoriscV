@@ -14,9 +14,13 @@ const CLAIM_BASE: u32 = 0x200004;         // Claim/complete per context
 const MAX_INTERRUPTS: usize = 128;
 const MAX_CONTEXTS: usize = 2; // M-mode and S-mode for hart 0
 
+use serde::{Serialize, Deserialize};
+
 /// PLIC device
+#[derive(Serialize, Deserialize)]
 pub struct Plic {
     /// Interrupt priorities (0 = disabled, 1-7 = priority)
+    #[serde(with = "BigArray")]
     priorities: [u8; MAX_INTERRUPTS],
     /// Pending interrupt bits
     pending: [u32; MAX_INTERRUPTS / 32],
@@ -216,5 +220,48 @@ impl Plic {
         self.claimed.fill(0);
         self.s_external_interrupt = false;
         self.m_external_interrupt = false;
+    }
+}
+
+// Helper for serializing large arrays (>32 elements)
+mod BigArray {
+    use super::*;
+    use serde::{Serializer, Deserializer};
+    use serde::ser::SerializeTuple;
+    use serde::de::{Visitor, SeqAccess, Error};
+    use std::fmt;
+
+    pub fn serialize<S>(data: &[u8; MAX_INTERRUPTS], serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        let mut seq = serializer.serialize_tuple(MAX_INTERRUPTS)?;
+        for e in data {
+            seq.serialize_element(e)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; MAX_INTERRUPTS], D::Error>
+    where D: Deserializer<'de> {
+        struct ArrayVisitor;
+
+        impl<'de> Visitor<'de> for ArrayVisitor {
+            type Value = [u8; MAX_INTERRUPTS];
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an array of length 128")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where A: SeqAccess<'de> {
+                let mut arr = [0u8; MAX_INTERRUPTS];
+                for i in 0..MAX_INTERRUPTS {
+                    arr[i] = seq.next_element()?
+                        .ok_or_else(|| Error::invalid_length(i, &self))?;
+                }
+                Ok(arr)
+            }
+        }
+
+        deserializer.deserialize_tuple(MAX_INTERRUPTS, ArrayVisitor)
     }
 }

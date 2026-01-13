@@ -7,6 +7,7 @@ mod clint;
 mod plic;
 pub mod virtio;
 pub mod virtio_9p;
+pub mod dtb;
 
 pub use uart::Uart;
 pub use clint::Clint;

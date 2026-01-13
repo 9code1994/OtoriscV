@@ -5,7 +5,9 @@
 use super::{Cpu, PrivilegeLevel};
 use super::decode::*;
 use super::trap::{self, Trap};
+use super::csr::*; // for MSTATUS_* constants
 use crate::memory::Bus;
+use super::mmu::AccessType;
 
 impl Cpu {
     /// Execute a single instruction
@@ -56,28 +58,45 @@ impl Cpu {
             }
             
             OP_LOAD => {
-                let addr = self.read_reg(d.rs1).wrapping_add(d.imm_i as u32);
+                let vaddr = self.read_reg(d.rs1).wrapping_add(d.imm_i as u32);
+                let satp = self.csr.satp;
+                let mstatus = self.csr.mstatus;
+                let mut priv_level = self.priv_level;
+                
+                // Handle MPRV (Modify Privilege)
+                if (mstatus & MSTATUS_MPRV) != 0 && priv_level == PrivilegeLevel::Machine {
+                    let mpp = (mstatus >> 11) & 3;
+                    priv_level = PrivilegeLevel::from(mpp as u8);
+                }
+                
+                // Translate address
+                let paddr = match self.mmu.translate(vaddr, AccessType::Load, priv_level, bus, satp, mstatus) {
+                    Ok(pa) => pa,
+                    Err(cause) => {
+                        return Err(Trap::from_cause(cause, vaddr));
+                    }
+                };
                 
                 let value = match d.funct3 {
-                    FUNCT3_LB => bus.read8(addr) as i8 as i32 as u32,
+                    FUNCT3_LB => bus.read8(paddr) as i8 as i32 as u32,
                     FUNCT3_LH => {
-                        if addr & 1 != 0 {
-                            return Err(Trap::LoadAddressMisaligned(addr));
+                        if vaddr & 1 != 0 {
+                            return Err(Trap::LoadAddressMisaligned(vaddr));
                         }
-                        bus.read16(addr) as i16 as i32 as u32
+                        bus.read16(paddr) as i16 as i32 as u32
                     }
                     FUNCT3_LW => {
-                        if addr & 3 != 0 {
-                            return Err(Trap::LoadAddressMisaligned(addr));
+                        if vaddr & 3 != 0 {
+                            return Err(Trap::LoadAddressMisaligned(vaddr));
                         }
-                        bus.read32(addr)
+                        bus.read32(paddr)
                     }
-                    FUNCT3_LBU => bus.read8(addr) as u32,
+                    FUNCT3_LBU => bus.read8(paddr) as u32,
                     FUNCT3_LHU => {
-                        if addr & 1 != 0 {
-                            return Err(Trap::LoadAddressMisaligned(addr));
+                        if vaddr & 1 != 0 {
+                            return Err(Trap::LoadAddressMisaligned(vaddr));
                         }
-                        bus.read16(addr) as u32
+                        bus.read16(paddr) as u32
                     }
                     _ => return Err(Trap::IllegalInstruction(inst)),
                 };
@@ -87,22 +106,39 @@ impl Cpu {
             }
             
             OP_STORE => {
-                let addr = self.read_reg(d.rs1).wrapping_add(d.imm_s as u32);
+                let vaddr = self.read_reg(d.rs1).wrapping_add(d.imm_s as u32);
                 let value = self.read_reg(d.rs2);
+                let satp = self.csr.satp;
+                let mstatus = self.csr.mstatus;
+                let mut priv_level = self.priv_level;
+                
+                // Handle MPRV
+                if (mstatus & MSTATUS_MPRV) != 0 && priv_level == PrivilegeLevel::Machine {
+                    let mpp = (mstatus >> 11) & 3;
+                    priv_level = PrivilegeLevel::from(mpp as u8);
+                }
+                
+                // Translate address
+                let paddr = match self.mmu.translate(vaddr, AccessType::Store, priv_level, bus, satp, mstatus) {
+                    Ok(pa) => pa,
+                    Err(cause) => {
+                        return Err(Trap::from_cause(cause, vaddr));
+                    }
+                };
                 
                 match d.funct3 {
-                    0b000 => bus.write8(addr, value as u8), // SB
+                    0b000 => bus.write8(paddr, value as u8), // SB
                     0b001 => { // SH
-                        if addr & 1 != 0 {
-                            return Err(Trap::StoreAddressMisaligned(addr));
+                        if vaddr & 1 != 0 {
+                            return Err(Trap::StoreAddressMisaligned(vaddr));
                         }
-                        bus.write16(addr, value as u16);
+                        bus.write16(paddr, value as u16);
                     }
                     0b010 => { // SW
-                        if addr & 3 != 0 {
-                            return Err(Trap::StoreAddressMisaligned(addr));
+                        if vaddr & 3 != 0 {
+                            return Err(Trap::StoreAddressMisaligned(vaddr));
                         }
-                        bus.write32(addr, value);
+                        bus.write32(paddr, value);
                     }
                     _ => return Err(Trap::IllegalInstruction(inst)),
                 }
@@ -361,9 +397,33 @@ impl Cpu {
             }
             FUNCT5_SC => {
                 // SC.W - Store Conditional
+                // Needs translation and check against reservation
+                let satp = self.csr.satp;
+                let mstatus = self.csr.mstatus;
+                let mut priv_level = self.priv_level;
+                
+                // Handle MPRV
+                if (mstatus & MSTATUS_MPRV) != 0 && priv_level == PrivilegeLevel::Machine {
+                    let mpp = (mstatus >> 11) & 3;
+                    priv_level = PrivilegeLevel::from(mpp as u8);
+                }
+                
+                // Need to use the original vaddr for reservation check
                 let success = self.reservation == Some(addr);
+                
                 if success {
-                    bus.write32(addr, self.read_reg(d.rs2));
+                     let paddr = match self.mmu.translate(addr, AccessType::Store, priv_level, bus, satp, mstatus) {
+                        Ok(pa) => pa,
+                        Err(cause) => {
+                            return Err(Trap::from_cause(cause, addr));
+                        }
+                    };
+                    
+                    if addr & 3 != 0 {
+                         return Err(Trap::StoreAddressMisaligned(addr));
+                    }
+                    
+                    bus.write32(paddr, self.read_reg(d.rs2));
                     self.write_reg(d.rd, 0); // Success
                 } else {
                     self.write_reg(d.rd, 1); // Failure

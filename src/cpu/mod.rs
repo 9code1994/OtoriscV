@@ -8,12 +8,15 @@ mod decode;
 mod execute;
 pub mod trap;
 
+pub mod mmu;
 pub use csr::Csr;
+pub use mmu::Mmu;
 
 use crate::memory::Bus;
+use serde::{Serialize, Deserialize};
 
 /// Privilege levels
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum PrivilegeLevel {
     User = 0,
@@ -33,6 +36,7 @@ impl From<u8> for PrivilegeLevel {
 }
 
 /// CPU state
+#[derive(Serialize, Deserialize)]
 pub struct Cpu {
     /// Program counter
     pub pc: u32,
@@ -51,6 +55,10 @@ pub struct Cpu {
     
     /// Instruction counter for performance
     pub instruction_count: u64,
+    
+    /// MMU for address translation
+    #[serde(skip)] // TODO: serialize MMU state
+    pub mmu: Mmu,
 }
 
 impl Cpu {
@@ -63,6 +71,7 @@ impl Cpu {
             wfi: false,
             reservation: None,
             instruction_count: 0,
+            mmu: Mmu::new(),
         };
         
         // x0 is always 0
@@ -91,8 +100,20 @@ impl Cpu {
     
     /// Execute one instruction
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<(), trap::Trap> {
-        // Fetch instruction
-        let inst = bus.read32(self.pc);
+        // Fetch instruction with translation
+        let satp = self.csr.satp;
+        let mstatus = self.csr.mstatus;
+        let priv_level = self.priv_level;
+        
+        // TODO: AccessType::Instruction should use executable permission check
+        let paddr = match self.mmu.translate(self.pc, mmu::AccessType::Instruction, priv_level, bus, satp, mstatus) {
+            Ok(pa) => pa,
+            Err(cause) => {
+                return Err(trap::Trap::from_cause(cause, self.pc));
+            }
+        };
+        
+        let inst = bus.read32(paddr);
         
         // Decode and execute
         self.execute(inst, bus)?;
