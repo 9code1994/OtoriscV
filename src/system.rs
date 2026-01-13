@@ -7,6 +7,7 @@ use crate::cpu::csr::*;
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
 use serde::{Serialize, Deserialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Device base addresses (matching jor1k)
 const CLINT_BASE: u32 = 0x0200_0000;
@@ -225,24 +226,7 @@ impl System {
         let fid = self.cpu.read_reg(16);  // a6 = Function ID
         let a0 = self.cpu.read_reg(10);
         let a1 = self.cpu.read_reg(11);
-        
-        // Debug: Log all SBI calls
-        static mut SBI_CALL_COUNT: u64 = 0;
-        static mut PUTCHAR_COUNT: u64 = 0;
-        unsafe {
-            SBI_CALL_COUNT += 1;
-            if eid == SBI_EXT_LEGACY_CONSOLE_PUTCHAR {
-                PUTCHAR_COUNT += 1;
-                // Show first 500 putchar calls
-                if PUTCHAR_COUNT <= 500 {
-                    eprint!("{}", a0 as u8 as char);
-                }
-            } else if SBI_CALL_COUNT <= 100 {
-                eprintln!("SBI#{}: EID=0x{:x} FID={} a0=0x{:x} a1=0x{:x} PC=0x{:x}", 
-                    SBI_CALL_COUNT, eid, fid, a0, a1, self.cpu.pc);
-            }
-        }
-        
+
         // SBI error codes
         const SBI_SUCCESS: u32 = 0;
         const SBI_ERR_NOT_SUPPORTED: u32 = (-2i32) as u32;

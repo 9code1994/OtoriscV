@@ -20,7 +20,7 @@ use serde::{Serialize, Deserialize};
 #[derive(Serialize, Deserialize)]
 pub struct Plic {
     /// Interrupt priorities (0 = disabled, 1-7 = priority)
-    #[serde(with = "BigArray")]
+    #[serde(with = "big_array")]
     priorities: [u8; MAX_INTERRUPTS],
     /// Pending interrupt bits
     pending: [u32; MAX_INTERRUPTS / 32],
@@ -224,7 +224,7 @@ impl Plic {
 }
 
 // Helper for serializing large arrays (>32 elements)
-mod BigArray {
+mod big_array {
     use super::*;
     use serde::{Serializer, Deserializer};
     use serde::ser::SerializeTuple;

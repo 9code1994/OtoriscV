@@ -1,8 +1,6 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write, stdout};
-use std::time::{Instant, Duration};
-use std::thread;
 
 // Use the library crate's modules
 use otoriscv::System;
@@ -10,6 +8,7 @@ use otoriscv::System;
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut kernel_path = String::new();
+    let mut initrd_path = String::new();
     let mut ram_size_mb = 64;
     let mut signature_file = String::new();
     let mut sig_begin = 0u32;
@@ -22,6 +21,10 @@ fn main() -> io::Result<()> {
             "--ram" => {
                 i += 1;
                 ram_size_mb = args[i].parse().expect("Invalid RAM size");
+            }
+            "--initrd" => {
+                i += 1;
+                initrd_path = args[i].clone();
             }
             "--signature" => {
                 i += 1;
@@ -49,12 +52,15 @@ fn main() -> io::Result<()> {
     }
 
     if kernel_path.is_empty() {
-        eprintln!("Usage: {} <kernel-image> [--ram <mb>] [--signature <file> --begin <addr> --end <addr>] [--raw]", args[0]);
+        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--signature <file> --begin <addr> --end <addr>] [--raw]", args[0]);
         std::process::exit(1);
     }
     
     println!("OtoRISCV CLI");
     println!("Loading kernel: {}", kernel_path);
+    if !initrd_path.is_empty() {
+        println!("Loading initrd: {}", initrd_path);
+    }
     println!("RAM Size: {} MB", ram_size_mb);
     
     let mut system = System::new(ram_size_mb).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -64,24 +70,45 @@ fn main() -> io::Result<()> {
     let mut kernel_data = Vec::new();
     f.read_to_end(&mut kernel_data)?;
     
+    // Read initrd if provided
+    let initrd_data = if !initrd_path.is_empty() {
+        let mut f = File::open(&initrd_path)?;
+        let mut data = Vec::new();
+        f.read_to_end(&mut data)?;
+        Some(data)
+    } else {
+        None
+    };
+    
     if raw_mode {
         system.load_binary(&kernel_data, 0x80000000).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         system.cpu.pc = 0x80000000;
     } else {
-        // Setup Linux boot
-        let cmdline = "console=ttyS0 root=/dev/vda ro";
-        system.setup_linux_boot(&kernel_data, cmdline).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        // Setup Linux boot with optional initrd
+        // lpj=10000 skips delay calibration loop for fast boot in emulator
+        // Use console=ttyS0 for NS16550 UART
+        let cmdline = if initrd_data.is_some() {
+            "lpj=10000 console=ttyS0 earlycon rdinit=/sbin/init"
+        } else {
+            "lpj=10000 console=ttyS0 earlycon root=/dev/vda ro"
+        };
+        
+        system.setup_linux_boot_with_initrd(
+            &kernel_data, 
+            initrd_data.as_deref(), 
+            cmdline
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
     
     println!("System ready. Starting emulation...");
     println!("-------------------------------------");
     
     let mut instructions: u64 = 0;
-    let max_cycles = 500_000_000; // Safety limit
+    let max_cycles = 10_000_000_000u64; // 10 billion cycles = 1000 seconds at 10MHz
     
     loop {
-        // Run a batch of cycles
-        let cycles_to_run = 1000;
+        // Run a batch of cycles for performance
+        let cycles_to_run = 10000;
         let cycles_run = system.run(cycles_to_run);
         instructions += cycles_run as u64;
         
@@ -90,14 +117,6 @@ fn main() -> io::Result<()> {
         if !output.is_empty() {
              stdout().write_all(&output)?;
              stdout().flush()?;
-        }
-        
-        // Check for halt conditions (EBREAK for tests, or WFI loop)
-        // Compliance tests often treat EBREAK as halt
-        let mcause = system.cpu.csr.mcause;
-        if mcause == 3 { // Breakpoint
-             println!("\nHit breakpoint (EBREAK) at {:x}, halting.", system.cpu.pc);
-             break;
         }
 
         if system.cpu.pc == 0 {
