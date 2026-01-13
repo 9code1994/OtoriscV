@@ -59,6 +59,10 @@ pub struct Cpu {
     /// MMU for address translation
     #[serde(skip)] // TODO: serialize MMU state
     pub mmu: Mmu,
+
+    // Debugging helpers
+    pub last_write_addr: u32,
+    pub last_write_val: u32,
 }
 
 impl Cpu {
@@ -72,6 +76,8 @@ impl Cpu {
             reservation: None,
             instruction_count: 0,
             mmu: Mmu::new(),
+            last_write_addr: 0,
+            last_write_val: 0,
         };
         
         // x0 is always 0

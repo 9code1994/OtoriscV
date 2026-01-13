@@ -74,37 +74,37 @@ pub const ROM_SIZE: u32 = 0x0000_2000;
 
 /// Bus interface for CPU memory access
 pub trait Bus {
-    fn read8(&self, addr: u32) -> u8;
+    fn read8(&mut self, addr: u32) -> u8;
     fn write8(&mut self, addr: u32, value: u8);
-    fn read16(&self, addr: u32) -> u16;
+    fn read16(&mut self, addr: u32) -> u16;
     fn write16(&mut self, addr: u32, value: u16);
-    fn read32(&self, addr: u32) -> u32;
+    fn read32(&mut self, addr: u32) -> u32;
     fn write32(&mut self, addr: u32, value: u32);
 }
 
 impl Bus for Memory {
-    fn read8(&self, addr: u32) -> u8 {
-        self.read8(addr)
+    fn read8(&mut self, addr: u32) -> u8 {
+        Memory::read8(self, addr)
     }
     
     fn write8(&mut self, addr: u32, value: u8) {
-        self.write8(addr, value)
+        Memory::write8(self, addr, value)
     }
     
-    fn read16(&self, addr: u32) -> u16 {
-        self.read16(addr)
+    fn read16(&mut self, addr: u32) -> u16 {
+        Memory::read16(self, addr)
     }
     
     fn write16(&mut self, addr: u32, value: u16) {
-        self.write16(addr, value)
+        Memory::write16(self, addr, value)
     }
     
-    fn read32(&self, addr: u32) -> u32 {
-        self.read32(addr)
+    fn read32(&mut self, addr: u32) -> u32 {
+        Memory::read32(self, addr)
     }
     
     fn write32(&mut self, addr: u32, value: u32) {
-        self.write32(addr, value)
+        Memory::write32(self, addr, value)
     }
 }
 
@@ -138,15 +138,67 @@ impl Memory {
         self.devices.get_mut(idx)
     }
     
-    /// Initialize boot ROM with jump to kernel
+    /// Initialize boot ROM with minimal SBI-like firmware
+    /// 
+    /// This sets up the system for Linux boot:
+    /// 1. Delegate exceptions/interrupts to S-mode
+    /// 2. Set MPP to Supervisor mode  
+    /// 3. Set MEPC to kernel entry (0x80000000)
+    /// 4. Use MRET to drop to S-mode and start kernel
     pub fn init_boot_rom(&mut self) {
-        // Boot at 0x1000, jump to DRAM_BASE (0x80000000)
-        // auipc t0, 0x80000000 - 0x1000 (load upper 20 bits)
-        // jalr zero, t0, 0 (jump to t0)
+        // Boot ROM at 0x1000
+        // Acts as minimal M-mode firmware like OpenSBI
+        //
+        // Linux expects:
+        // - a0 = hartid (already set by setup_linux_boot)
+        // - a1 = dtb address (already set by setup_linux_boot)
+        // - Running in S-mode with SBI available for ecalls
         
-        let instructions: [u32; 8] = [
-            0x7ffff297,           // auipc t0, 0x7ffff (t0 = 0x1000 + 0x7ffff000 = 0x80000000)
-            0x00028067,           // jalr zero, t0, 0
+        let instructions: [u32; 29] = [
+            // === Setup exception delegation ===
+            // Delegate most exceptions to S-mode, but NOT ecall from S-mode
+            // medeleg = 0xB1FF (delegate exceptions 0-8, 12-15 to S-mode)
+            // Bit 8 (ecall from U) is delegated, bit 9 (ecall from S) is NOT
+            0x0000b2b7,           // lui t0, 0xB         ; t0 = 0xB000
+            0x1ff28293,           // addi t0, t0, 0x1FF  ; t0 = 0xB1FF
+            0x30229073,           // csrw medeleg, t0
+            
+            // Delegate S-mode interrupts (bits 1,5,9 = SSI, STI, SEI)
+            0x00000293,           // li t0, 0
+            0x22228293,           // addi t0, t0, 0x222  ; t0 = 0x222 (SSI+STI+SEI)
+            0x30329073,           // csrw mideleg, t0
+            
+            // === Setup mstatus for transition to S-mode ===
+            // Set MPP = Supervisor (01), MPIE = 1
+            // mstatus bits: MPP[12:11]=01 (S-mode), MPIE[7]=1
+            0x00000297,           // auipc t0, 0         ; t0 = PC (for computing addresses)
+            0x00001337,           // lui t1, 1           ; t1 = 0x1000
+            0x88030313,           // addi t1, t1, -0x780 ; t1 = 0x880 (MPP=01, MPIE=1)
+            0x30031073,           // csrw mstatus, t1
+            
+            // === Set mepc to kernel entry point ===
+            0x800002b7,           // lui t0, 0x80000     ; t0 = 0x80000000
+            0x34129073,           // csrw mepc, t0
+            
+            // === Set up mtvec for SBI trap handler ===
+            // Point to simple SBI handler at ROM address 0x1080
+            0x000012b7,           // lui t0, 0x1         ; t0 = 0x1000
+            0x08028293,           // addi t0, t0, 0x80   ; t0 = 0x1080
+            0x30529073,           // csrw mtvec, t0
+            
+            // === Enable counter access from S-mode ===
+            0x00700293,           // li t0, 7            ; enable cycle, time, instret
+            0x30629073,           // csrw mcounteren, t0
+            
+            // === Jump to S-mode kernel using MRET ===
+            0x30200073,           // mret
+            
+            // === Padding ===
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
             0x00000013,           // nop
             0x00000013,           // nop
             0x00000013,           // nop
@@ -161,6 +213,36 @@ impl Memory {
             self.rom[offset + 1] = (inst >> 8) as u8;
             self.rom[offset + 2] = (inst >> 16) as u8;
             self.rom[offset + 3] = (inst >> 24) as u8;
+        }
+        
+        // Add SBI trap handler at offset 0x80 (address 0x1080)
+        // This handles ecalls from S-mode (SBI calls)
+        self.init_sbi_handler();
+    }
+    
+    /// Initialize SBI ecall handler stub in boot ROM
+    /// 
+    /// Note: SBI calls are now handled directly in Rust (system.rs handle_sbi_call).
+    /// This stub is kept for compatibility but should never be executed.
+    fn init_sbi_handler(&mut self) {
+        // Minimal SBI handler stub at ROM offset 0x80 (address 0x1080)
+        // Just in case we somehow reach here, loop forever
+        let sbi_handler: [u32; 4] = [
+            0x0000006f,           // 0x00: j 0 (infinite loop)
+            0x00000013,           // 0x04: nop
+            0x00000013,           // 0x08: nop
+            0x00000013,           // 0x0C: nop
+        ];
+        
+        // Write SBI handler at offset 0x80
+        for (i, &inst) in sbi_handler.iter().enumerate() {
+            let offset = 0x80 + i * 4;
+            if offset + 3 < self.rom.len() {
+                self.rom[offset] = inst as u8;
+                self.rom[offset + 1] = (inst >> 8) as u8;
+                self.rom[offset + 2] = (inst >> 16) as u8;
+                self.rom[offset + 3] = (inst >> 24) as u8;
+            }
         }
     }
     

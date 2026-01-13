@@ -54,6 +54,11 @@ impl Clint {
         self.mtime
     }
     
+    /// Get current mtimecmp
+    pub fn get_mtimecmp(&self) -> u64 {
+        self.mtimecmp
+    }
+    
     /// Check if timer interrupt should fire
     fn check_timer(&mut self) {
         self.timer_interrupt = self.mtime >= self.mtimecmp;

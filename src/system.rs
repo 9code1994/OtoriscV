@@ -31,7 +31,7 @@ pub struct System {
     
     // Direct device references (since we can't easily downcast)
     uart: Uart,
-    clint: Clint,
+    pub clint: Clint,
     plic: Plic,
     virtio9p: Virtio9p,
 }
@@ -64,28 +64,81 @@ impl System {
     /// Setup system for Linux booting
     /// Loads kernel image and generates/loads DTB
     pub fn setup_linux_boot(&mut self, kernel: &[u8], cmdline: &str) -> Result<(), String> {
+        self.setup_linux_boot_with_initrd(kernel, None, cmdline)
+    }
+    
+    /// Setup system for Linux booting with optional initrd
+    /// Loads kernel, initrd (if provided), and generates DTB
+    pub fn setup_linux_boot_with_initrd(&mut self, kernel: &[u8], initrd: Option<&[u8]>, cmdline: &str) -> Result<(), String> {
         // Load kernel at DRAM_BASE (0x80000000)
         self.load_binary(kernel, DRAM_BASE)?;
         
-        // Generate DTB
         let ram_size = self.memory.ram_size();
         let ram_size_mb = (ram_size / 1024 / 1024) as u32;
-        let dtb = crate::devices::dtb::generate_fdt(ram_size_mb, cmdline);
+        
+        // Calculate addresses for initrd and DTB
+        // Layout: [kernel] ... [initrd aligned to 4KB] [DTB aligned to 4KB] [end of RAM]
+        let ram_end = DRAM_BASE + ram_size as u32;
+        
+        // Load initrd if provided
+        let initrd_info = if let Some(initrd_data) = initrd {
+            // Place initrd before DTB, aligned to page boundary
+            // Reserve space for DTB (typically ~4KB, reserve 64KB to be safe)
+            let dtb_reserve = 64 * 1024;
+            let initrd_end = (ram_end - dtb_reserve) & !0xFFF; // Align down to 4KB
+            let initrd_start = (initrd_end - initrd_data.len() as u32) & !0xFFF; // Align down
+            
+            // Make sure initrd doesn't overlap kernel
+            let kernel_end = DRAM_BASE + kernel.len() as u32;
+            if initrd_start < kernel_end + 0x100000 { // Leave at least 1MB gap
+                return Err(format!(
+                    "Not enough RAM for kernel ({} bytes) and initrd ({} bytes)", 
+                    kernel.len(), initrd_data.len()
+                ));
+            }
+            
+            self.load_binary(initrd_data, initrd_start)?;
+            println!("  Initrd loaded at 0x{:08x}-0x{:08x} ({} bytes)", 
+                     initrd_start, initrd_start + initrd_data.len() as u32, initrd_data.len());
+            
+            Some((initrd_start, initrd_start + initrd_data.len() as u32))
+        } else {
+            None
+        };
+        
+        // Generate DTB with initrd info
+        let dtb = crate::devices::dtb::generate_fdt(ram_size_mb, cmdline, initrd_info);
         
         // Load DTB at end of RAM (aligned to 4KB)
-        let dtb_addr = DRAM_BASE + ram_size as u32 - dtb.len() as u32;
-        let dtb_addr = dtb_addr & !0xFFF; // Align down
+        let dtb_addr = if initrd_info.is_some() {
+            // Place after initrd
+            let (_, initrd_end) = initrd_info.unwrap();
+            (initrd_end + 0x1000) & !0xFFF // Align up with some padding
+        } else {
+            // No initrd, place at end of RAM
+            (ram_end - dtb.len() as u32) & !0xFFF
+        };
+        
+        // Actually, let's put DTB at end of RAM to be safe
+        let dtb_addr = (ram_end - dtb.len() as u32) & !0xFFF;
         
         self.load_binary(&dtb, dtb_addr)?;
+        println!("  DTB loaded at 0x{:08x} ({} bytes)", dtb_addr, dtb.len());
         
-        // Setup CPU State for Linux boot
-        // PC = Kernel start (0x80000000)
+        // Setup CPU State for Linux boot via boot ROM
+        // Boot ROM at 0x1000 will:
+        // 1. Set up medeleg/mideleg for exception delegation
+        // 2. Set mtvec to SBI handler
+        // 3. Set MPP=Supervisor in mstatus
+        // 4. Set mepc=0x80000000 (kernel entry)
+        // 5. Execute mret to drop to S-mode and start kernel
+        //
+        // We just need to set up the registers that Linux expects:
         // a0 (x10) = hartid (0)
         // a1 (x11) = dtb address
-        self.cpu.reset();
-        self.cpu.pc = DRAM_BASE;
-        self.cpu.write_reg(10, 0);       // a0
-        self.cpu.write_reg(11, dtb_addr); // a1
+        self.cpu.reset();  // PC = 0x1000 (boot ROM)
+        self.cpu.write_reg(10, 0);       // a0 = hartid
+        self.cpu.write_reg(11, dtb_addr); // a1 = dtb address
         
         Ok(())
     }
@@ -118,7 +171,12 @@ impl System {
             match self.step_with_devices() {
                 Ok(()) => {}
                 Err(trap) => {
-                    self.cpu.handle_trap(trap);
+                    // Handle SBI calls from S-mode directly in Rust
+                    if let crate::cpu::trap::Trap::EnvironmentCallFromS = trap {
+                        self.handle_sbi_call();
+                    } else {
+                        self.cpu.handle_trap(trap);
+                    }
                 }
             }
             
@@ -151,14 +209,165 @@ impl System {
         
         result
     }
+    
+    /// Handle SBI (Supervisor Binary Interface) calls from S-mode
+    /// 
+    /// SBI provides M-mode services to S-mode OS like Linux.
+    /// The kernel uses ecall to invoke SBI services.
+    /// 
+    /// Calling convention:
+    /// - a7 = Extension ID (EID)
+    /// - a6 = Function ID (FID)  
+    /// - a0-a5 = Arguments
+    /// - Returns: a0 = error code, a1 = value
+    fn handle_sbi_call(&mut self) {
+        let eid = self.cpu.read_reg(17);  // a7 = Extension ID
+        let fid = self.cpu.read_reg(16);  // a6 = Function ID
+        let a0 = self.cpu.read_reg(10);
+        let a1 = self.cpu.read_reg(11);
+        
+        // Debug: Log all SBI calls
+        static mut SBI_CALL_COUNT: u64 = 0;
+        static mut PUTCHAR_COUNT: u64 = 0;
+        unsafe {
+            SBI_CALL_COUNT += 1;
+            if eid == SBI_EXT_LEGACY_CONSOLE_PUTCHAR {
+                PUTCHAR_COUNT += 1;
+                // Show first 500 putchar calls
+                if PUTCHAR_COUNT <= 500 {
+                    eprint!("{}", a0 as u8 as char);
+                }
+            } else if SBI_CALL_COUNT <= 100 {
+                eprintln!("SBI#{}: EID=0x{:x} FID={} a0=0x{:x} a1=0x{:x} PC=0x{:x}", 
+                    SBI_CALL_COUNT, eid, fid, a0, a1, self.cpu.pc);
+            }
+        }
+        
+        // SBI error codes
+        const SBI_SUCCESS: u32 = 0;
+        const SBI_ERR_NOT_SUPPORTED: u32 = (-2i32) as u32;
+        
+        // Extension IDs
+        const SBI_EXT_LEGACY_SET_TIMER: u32 = 0;
+        const SBI_EXT_LEGACY_CONSOLE_PUTCHAR: u32 = 1;
+        const SBI_EXT_LEGACY_CONSOLE_GETCHAR: u32 = 2;
+        const SBI_EXT_BASE: u32 = 0x10;
+        const SBI_EXT_TIME: u32 = 0x54494D45;  // "TIME"
+        const SBI_EXT_IPI: u32 = 0x735049;     // "sPI"
+        const SBI_EXT_RFENCE: u32 = 0x52464E43; // "RFNC"
+        const SBI_EXT_HSM: u32 = 0x48534D;     // "HSM"
+        const SBI_EXT_SRST: u32 = 0x53525354;  // "SRST"
+        
+        let (error, value) = match eid {
+            SBI_EXT_LEGACY_SET_TIMER => {
+                // Legacy set_timer: a0,a1 = 64-bit timer value
+                self.clint.write32(0x4000, a0);      // mtimecmp low
+                self.clint.write32(0x4004, a1);      // mtimecmp high
+                // Clear pending timer interrupt when new timer is set
+                self.cpu.csr.clear_interrupt_pending(MIP_STIP);
+                (SBI_SUCCESS, 0)
+            }
+            
+            SBI_EXT_LEGACY_CONSOLE_PUTCHAR => {
+                // Legacy console_putchar: a0 = character
+                self.uart.write8(0, a0 as u8);
+                (SBI_SUCCESS, 0)
+            }
+            
+            SBI_EXT_LEGACY_CONSOLE_GETCHAR => {
+                // Legacy console_getchar: returns character in a0, or -1 if none
+                // For now, return -1 (no input available)
+                ((-1i32) as u32, 0)
+            }
+            
+            SBI_EXT_BASE => {
+                // Base extension - provides SBI version info
+                match fid {
+                    0 => (SBI_SUCCESS, 0x00000002),  // sbi_get_spec_version: return SBI 0.2
+                    1 => (SBI_SUCCESS, 0),            // sbi_get_impl_id: 0 = BBL
+                    2 => (SBI_SUCCESS, 0),            // sbi_get_impl_version  
+                    3 => {
+                        // sbi_probe_extension: check if extension is available
+                        // a0 = extension ID to probe
+                        let probe_eid = a0;
+                        let available = match probe_eid {
+                            0 => 1,                           // Legacy set_timer
+                            1 => 1,                           // Legacy console_putchar
+                            2 => 1,                           // Legacy console_getchar
+                            0x10 => 1,                        // SBI_EXT_BASE
+                            0x54494D45 => 1,                  // SBI_EXT_TIME
+                            0x735049 => 0,                    // SBI_EXT_IPI - not available
+                            0x52464E43 => 0,                  // SBI_EXT_RFENCE - not available
+                            0x48534D => 0,                    // SBI_EXT_HSM - not available
+                            0x53525354 => 0,                  // SBI_EXT_SRST - not available
+                            _ => 0,
+                        };
+                        (SBI_SUCCESS, available)
+                    }
+                    4 => (SBI_SUCCESS, 0),            // sbi_get_mvendorid
+                    5 => (SBI_SUCCESS, 0),            // sbi_get_marchid
+                    6 => (SBI_SUCCESS, 0),            // sbi_get_mimpid
+                    _ => (SBI_ERR_NOT_SUPPORTED, 0),
+                }
+            }
+            
+            SBI_EXT_TIME => {
+                // Timer extension
+                match fid {
+                    0 => {
+                        // sbi_set_timer: a0,a1 = 64-bit timer value
+                        self.clint.write32(0x4000, a0);
+                        self.clint.write32(0x4004, a1);
+                        self.cpu.csr.clear_interrupt_pending(MIP_STIP);
+                        (SBI_SUCCESS, 0)
+                    }
+                    _ => (SBI_ERR_NOT_SUPPORTED, 0),
+                }
+            }
+            
+            SBI_EXT_IPI | SBI_EXT_RFENCE | SBI_EXT_HSM => {
+                // IPI, remote fence, HSM - minimal support
+                (SBI_SUCCESS, 0)
+            }
+            
+            SBI_EXT_SRST => {
+                // System reset
+                match fid {
+                    0 => {
+                        // sbi_system_reset
+                        eprintln!("SBI system reset requested");
+                        self.cpu.wfi = true;  // Halt
+                        (SBI_SUCCESS, 0)
+                    }
+                    _ => (SBI_ERR_NOT_SUPPORTED, 0),
+                }
+            }
+            
+            _ => {
+                // Unknown extension - return not supported
+                (SBI_ERR_NOT_SUPPORTED, 0)
+            }
+        };
+        
+        // Set return values
+        self.cpu.write_reg(10, error);  // a0 = error
+        self.cpu.write_reg(11, value);  // a1 = value
+        
+        // Advance PC past ecall
+        self.cpu.pc = self.cpu.pc.wrapping_add(4);
+    }
 
     /// Update interrupt pending bits from devices
     fn update_interrupts(&mut self) {
-        // CLINT interrupts
+        // CLINT timer interrupt
+        // When CLINT timer fires, we set both MTIP and STIP
+        // The kernel in S-mode sees STIP (which is delegated via mideleg)
         if self.clint.timer_interrupt {
             self.cpu.csr.set_interrupt_pending(MIP_MTIP);
+            self.cpu.csr.set_interrupt_pending(MIP_STIP);
         } else {
             self.cpu.csr.clear_interrupt_pending(MIP_MTIP);
+            self.cpu.csr.clear_interrupt_pending(MIP_STIP);
         }
         
         if self.clint.software_interrupt {
@@ -168,8 +377,12 @@ impl System {
         }
         
         // UART -> PLIC
+        // Note: PLIC pending bits are cleared via claim/complete mechanism
+        // We only raise interrupts here, the UART interrupt is level-triggered
         if self.uart.has_interrupt() {
             self.plic.raise_interrupt(UART_IRQ);
+        } else {
+            self.plic.clear_interrupt(UART_IRQ);
         }
         
         // PLIC -> CPU
@@ -263,7 +476,7 @@ struct SystemBus<'a> {
 use crate::memory::Bus;
 
 impl<'a> Bus for SystemBus<'a> {
-    fn read8(&self, addr: u32) -> u8 {
+    fn read8(&mut self, addr: u32) -> u8 {
         // Check CLINT
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             return self.clint.read8(addr - CLINT_BASE);
@@ -309,7 +522,7 @@ impl<'a> Bus for SystemBus<'a> {
         self.memory.write8(addr, value);
     }
     
-    fn read16(&self, addr: u32) -> u16 {
+    fn read16(&mut self, addr: u32) -> u16 {
         // For devices, we can fall back to read8 logic (or implement specific if needed)
         // Since our devices don't explicitly implement read16, we'll compose it
         // BUT wait, Clint and Plic MIGHT support wide reads.
@@ -328,7 +541,7 @@ impl<'a> Bus for SystemBus<'a> {
         self.write8(addr + 1, (value >> 8) as u8);
     }
     
-    fn read32(&self, addr: u32) -> u32 {
+    fn read32(&mut self, addr: u32) -> u32 {
         // Check CLINT
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             return self.clint.read32(addr - CLINT_BASE);

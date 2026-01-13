@@ -146,7 +146,8 @@ impl DtbBuilder {
 }
 
 /// Generate the Device Tree Blob for our emulator
-pub fn generate_fdt(ram_size_mb: u32, cmdline: &str) -> Vec<u8> {
+/// If initrd_start and initrd_end are provided, adds initrd info to /chosen
+pub fn generate_fdt(ram_size_mb: u32, cmdline: &str, initrd: Option<(u32, u32)>) -> Vec<u8> {
     let mut dtb = DtbBuilder::new();
     
     // Root node
@@ -159,6 +160,15 @@ pub fn generate_fdt(ram_size_mb: u32, cmdline: &str) -> Vec<u8> {
     // /chosen
     dtb.begin_node("chosen");
     dtb.property_string("bootargs", cmdline);
+    dtb.property_string("stdout-path", "/soc/uart@3000000");
+    
+    // Add initrd location if provided
+    if let Some((start, end)) = initrd {
+        // Linux expects these as 32-bit values for rv32
+        dtb.property_u32("linux,initrd-start", start);
+        dtb.property_u32("linux,initrd-end", end);
+    }
+    
     dtb.end_node();
     
     // /cpus
@@ -208,9 +218,11 @@ pub fn generate_fdt(ram_size_mb: u32, cmdline: &str) -> Vec<u8> {
         // CLINT
         dtb.begin_node("clint@2000000");
         dtb.property_string("compatible", "riscv,clint0");
-        // Interrupts: M-mode SW (3) and Timer (7) for CPU 0
-        // interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>
-        dtb.property_array_u32("interrupts-extended", &[1, 3, 1, 7]); 
+        // Interrupts for CPU 0 (phandle 1):
+        // - S-mode SW (1), M-mode SW (3), S-mode Timer (5), M-mode Timer (7)
+        // Linux in S-mode uses S-mode timer (5)
+        // Format: &cpu_intc irq_num repeated for each interrupt
+        dtb.property_array_u32("interrupts-extended", &[1, 3, 1, 7, 1, 1, 1, 5]); 
         dtb.property_array_u32("reg", &[0, 0x02000000, 0, 0x10000]);
         dtb.end_node();
         

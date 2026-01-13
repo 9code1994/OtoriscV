@@ -53,8 +53,10 @@ pub struct Uart {
     /// Divisor latch (when DLAB set)
     divisor: u16,
     
-    /// Pending interrupt
-    pending_interrupt: bool,
+    /// Internal interrupt pending flags (bitmask for each interrupt type)
+    /// Bit 2: RX data interrupt (CTI)
+    /// Bit 1: TX holding register empty (THRI)  
+    interrupt_flags: u8,
     /// Interrupt line number
     pub interrupt_line: u32,
 }
@@ -70,7 +72,7 @@ impl Uart {
             scr: 0,
             fifo_enabled: false,
             divisor: 0,
-            pending_interrupt: false,
+            interrupt_flags: 0,
             interrupt_line,
         }
     }
@@ -78,7 +80,8 @@ impl Uart {
     /// Receive a character from host (keyboard input)
     pub fn receive_char(&mut self, c: u8) {
         self.rx_fifo.push_back(c);
-        self.check_interrupt();
+        // Set RX data available interrupt flag
+        self.interrupt_flags |= IIR_RX_AVAILABLE;
     }
     
     /// Get pending TX output
@@ -86,26 +89,17 @@ impl Uart {
         std::mem::take(&mut self.tx_buffer)
     }
     
-    /// Check if interrupt should be raised
-    fn check_interrupt(&mut self) {
-        let mut interrupt = false;
-        
-        // RX data available and RX interrupt enabled
-        if !self.rx_fifo.is_empty() && (self.ier & IER_RX_AVAILABLE) != 0 {
-            interrupt = true;
-        }
-        
-        // TX empty and TX interrupt enabled
-        if (self.ier & IER_TX_EMPTY) != 0 {
-            interrupt = true;
-        }
-        
-        self.pending_interrupt = interrupt;
-    }
-    
-    /// Check if interrupt is pending
+    /// Check if interrupt is pending based on flags and enabled interrupts
     pub fn has_interrupt(&self) -> bool {
-        self.pending_interrupt
+        // RX data available interrupt
+        if (self.interrupt_flags & IIR_RX_AVAILABLE) != 0 && (self.ier & IER_RX_AVAILABLE) != 0 {
+            return true;
+        }
+        // TX holding register empty interrupt
+        if (self.interrupt_flags & IIR_TX_EMPTY) != 0 && (self.ier & IER_TX_EMPTY) != 0 {
+            return true;
+        }
+        false
     }
     
     /// Get Line Status Register value
@@ -118,15 +112,17 @@ impl Uart {
     }
     
     /// Get Interrupt Identification Register value
-    fn get_iir(&self) -> u8 {
+    fn get_iir(&mut self) -> u8 {
         let fifo_bits = if self.fifo_enabled { IIR_FIFO_ENABLED } else { 0 };
         
         // Priority: RX available > TX empty
-        if !self.rx_fifo.is_empty() && (self.ier & IER_RX_AVAILABLE) != 0 {
+        if (self.interrupt_flags & IIR_RX_AVAILABLE) != 0 && (self.ier & IER_RX_AVAILABLE) != 0 {
             return fifo_bits | IIR_RX_AVAILABLE;
         }
         
-        if (self.ier & IER_TX_EMPTY) != 0 {
+        if (self.interrupt_flags & IIR_TX_EMPTY) != 0 && (self.ier & IER_TX_EMPTY) != 0 {
+            // Reading IIR when THRI is the source clears the THRI interrupt
+            self.interrupt_flags &= !IIR_TX_EMPTY;
             return fifo_bits | IIR_TX_EMPTY;
         }
         
@@ -139,13 +135,18 @@ impl Uart {
     }
 
     /// Read register
-    pub fn read8(&self, offset: u32) -> u8 {
+    pub fn read8(&mut self, offset: u32) -> u8 {
         match offset {
             UART_RBR => {
                 if self.is_dlab_set() {
                     self.divisor as u8
                 } else {
-                    self.rx_fifo.front().copied().unwrap_or(0)
+                    let c = self.rx_fifo.pop_front().unwrap_or(0);
+                    // Clear RX interrupt if FIFO is now empty
+                    if self.rx_fifo.is_empty() {
+                        self.interrupt_flags &= !IIR_RX_AVAILABLE;
+                    }
+                    c
                 }
             }
             UART_IER => {
@@ -173,6 +174,8 @@ impl Uart {
                     self.divisor = (self.divisor & 0xFF00) | (value as u16);
                 } else {
                     self.tx_buffer.push(value);
+                    // Raise TX empty interrupt (data was written and "sent" immediately)
+                    self.interrupt_flags |= IIR_TX_EMPTY;
                 }
             }
             UART_IER => {
@@ -180,13 +183,21 @@ impl Uart {
                     self.divisor = (self.divisor & 0x00FF) | ((value as u16) << 8);
                 } else {
                     self.ier = value & 0x0F;
-                    self.check_interrupt();
+                    // Writing to IER clears THRI flag (as per jor1k behavior)
+                    self.interrupt_flags &= !IIR_TX_EMPTY;
                 }
             }
             UART_FCR => {
                 self.fifo_enabled = (value & 0x01) != 0;
                 if (value & 0x02) != 0 {
+                    // Clear RX FIFO
                     self.rx_fifo.clear();
+                    self.interrupt_flags &= !IIR_RX_AVAILABLE;
+                }
+                if (value & 0x04) != 0 {
+                    // Clear TX FIFO
+                    self.tx_buffer.clear();
+                    self.interrupt_flags &= !IIR_TX_EMPTY;
                 }
             }
             UART_LCR => self.lcr = value,
@@ -194,10 +205,9 @@ impl Uart {
             UART_SCR => self.scr = value,
             _ => {}
         }
-        self.check_interrupt();
     }
     
-    pub fn read32(&self, offset: u32) -> u32 {
+    pub fn read32(&mut self, offset: u32) -> u32 {
         self.read8(offset) as u32
     }
     
@@ -215,7 +225,7 @@ impl Uart {
         self.scr = 0;
         self.fifo_enabled = false;
         self.divisor = 0;
-        self.pending_interrupt = false;
+        self.interrupt_flags = 0;
     }
 
     /// Read and consume from RX FIFO (called when actually reading RBR)
@@ -224,7 +234,9 @@ impl Uart {
             self.divisor as u8
         } else {
             let c = self.rx_fifo.pop_front().unwrap_or(0);
-            self.check_interrupt();
+            if self.rx_fifo.is_empty() {
+                self.interrupt_flags &= !IIR_RX_AVAILABLE;
+            }
             c
         }
     }

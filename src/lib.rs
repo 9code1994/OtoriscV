@@ -5,7 +5,7 @@
 
 use wasm_bindgen::prelude::*;
 
-mod cpu;
+pub mod cpu;
 mod memory;
 mod devices;
 mod system;
