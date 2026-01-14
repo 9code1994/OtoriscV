@@ -51,6 +51,25 @@ impl DecodedInst {
         }
     }
 
+    /// Create from cached instruction (fast path - no decoding needed)
+    #[inline(always)]
+    pub fn from_cached(cached: &super::icache::CachedInst) -> Self {
+        DecodedInst {
+            opcode: cached.opcode as u32,
+            rd: cached.rd as u32,
+            rs1: cached.rs1 as u32,
+            rs2: cached.rs2 as u32,
+            rs3: cached.rs3 as u32,
+            funct3: cached.funct3 as u32,
+            funct7: cached.funct7 as u32,
+            imm_i: 0,
+            imm_s: 0,
+            imm_b: 0,
+            imm_u: 0,
+            imm_j: 0,
+        }
+    }
+
     #[inline(always)]
     pub fn imm_i(inst: u32) -> i32 {
         (inst as i32) >> 20

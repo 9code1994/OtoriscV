@@ -4,6 +4,7 @@
 
 use super::Cpu;
 use super::decode::*;
+use super::icache::CachedInst;
 use super::csr::*; // for MSTATUS_* constants
 use super::mmu::AccessType;
 use crate::cpu::PrivilegeLevel;
@@ -11,9 +12,10 @@ use crate::cpu::trap::{self, Trap};
 use crate::memory::Bus;
 
 impl Cpu {
-    /// Execute a single instruction
-    pub fn execute(&mut self, inst: u32, bus: &mut impl Bus) -> Result<(), Trap> {
-        let d = DecodedInst::decode(inst);
+    /// Execute using cached decoded instruction (fast path)
+    #[inline(always)]
+    pub fn execute_cached(&mut self, inst: u32, cached: &CachedInst, bus: &mut impl Bus) -> Result<(), Trap> {
+        let d = DecodedInst::from_cached(cached);
         
         match d.opcode {
             OP_LUI => {
@@ -545,6 +547,26 @@ impl Cpu {
                 
                 bus.write32(paddr, new_val);
                 self.write_reg(d.rd, old_val);
+            }
+        }
+        
+        self.pc = self.pc.wrapping_add(4);
+        Ok(())
+    }
+
+    /// Execute a single instruction (with decoding - fallback path)
+    pub fn execute(&mut self, inst: u32, bus: &mut impl Bus) -> Result<(), Trap> {
+        let d = DecodedInst::decode(inst);
+        
+        match d.opcode {
+            OP_LUI => {
+                let imm = DecodedInst::imm_u(inst) as u32;
+                self.write_reg(d.rd, imm);
+            }
+            _ => {
+                // For simplicity, convert to cached and call execute_cached
+                let cached = super::icache::CachedInst::decode(inst);
+                return self.execute_cached(inst, &cached, bus);
             }
         }
         

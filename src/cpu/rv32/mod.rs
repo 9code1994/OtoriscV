@@ -9,9 +9,11 @@ mod decode;
 mod execute;
 mod execute_fp;
 pub mod mmu;
+pub mod icache;
 
 pub use csr::Csr;
 pub use mmu::Mmu;
+pub use icache::{ICache, CachedInst};
 
 use super::PrivilegeLevel;
 use super::fpu::Fpu;
@@ -43,8 +45,12 @@ pub struct Cpu {
     pub instruction_count: u64,
     
     /// MMU for address translation
-    #[serde(skip)] // TODO: serialize MMU state
+    #[serde(skip)]
     pub mmu: Mmu,
+    
+    /// Instruction cache
+    #[serde(skip)]
+    pub icache: ICache,
 
     // Debugging helpers
     pub last_write_addr: u32,
@@ -63,6 +69,7 @@ impl Cpu {
             reservation: None,
             instruction_count: 0,
             mmu: Mmu::new(),
+            icache: ICache::new(),
             last_write_addr: 0,
             last_write_val: 0,
         };
@@ -98,7 +105,6 @@ impl Cpu {
         let mstatus = self.csr.mstatus;
         let priv_level = self.priv_level;
         
-        // TODO: AccessType::Instruction should use executable permission check
         let paddr = match self.mmu.translate(self.pc, mmu::AccessType::Instruction, priv_level, bus, satp, mstatus) {
             Ok(pa) => pa,
             Err(cause) => {
@@ -108,8 +114,11 @@ impl Cpu {
         
         let inst = bus.read32(paddr);
         
-        // Decode and execute
-        self.execute(inst, bus)?;
+        // Try instruction cache
+        let cached = self.icache.get_or_decode(paddr, inst);
+        
+        // Execute with cached decode
+        self.execute_cached(inst, &cached, bus)?;
         
         self.instruction_count += 1;
         
