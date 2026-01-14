@@ -2,8 +2,9 @@
 //!
 //! Based on jor1k's safecpu.js trap implementation
 
-use super::{Cpu, PrivilegeLevel};
-use super::csr::*;
+use super::PrivilegeLevel;
+use super::rv32::Cpu;
+use super::rv32::csr::*;
 
 /// Exception/interrupt cause
 #[derive(Debug, Clone, Copy)]
@@ -281,7 +282,6 @@ pub fn mret(cpu: &mut Cpu) {
 pub fn sret(cpu: &mut Cpu) {
     // Restore privilege from SPP
     let spp = (cpu.csr.mstatus >> 8) & 1;
-    let old_priv = cpu.priv_level;
     cpu.priv_level = if spp == 1 { 
         PrivilegeLevel::Supervisor 
     } else { 

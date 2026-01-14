@@ -2,12 +2,13 @@
 //!
 //! Implements RV32IMA instruction semantics
 
-use super::{Cpu, PrivilegeLevel};
+use super::Cpu;
 use super::decode::*;
-use super::trap::{self, Trap};
 use super::csr::*; // for MSTATUS_* constants
-use crate::memory::Bus;
 use super::mmu::AccessType;
+use crate::cpu::PrivilegeLevel;
+use crate::cpu::trap::{self, Trap};
+use crate::memory::Bus;
 
 impl Cpu {
     /// Execute a single instruction
@@ -248,6 +249,23 @@ impl Cpu {
                 self.execute_amo(inst, &d, bus)?;
             }
             
+            // Floating-point extensions (F and D)
+            OP_LOAD_FP => {
+                self.execute_load_fp(inst, &d, bus)?;
+            }
+            
+            OP_STORE_FP => {
+                self.execute_store_fp(inst, &d, bus)?;
+            }
+            
+            OP_MADD | OP_MSUB | OP_NMSUB | OP_NMADD => {
+                self.execute_fma(inst, &d, d.opcode)?;
+            }
+            
+            OP_OP_FP => {
+                self.execute_op_fp(inst, &d)?;
+            }
+            
             _ => {
                 return Err(Trap::IllegalInstruction(inst));
             }
@@ -380,9 +398,14 @@ impl Cpu {
                     self.read_reg(d.rs1)
                 };
                 
-                // Read current CSR value
-                let old_val = self.csr.read(csr_addr, self.priv_level)
-                    .ok_or(Trap::IllegalInstruction(inst))?;
+                // Handle FP CSRs specially (they live in FPU, not CSR)
+                let old_val = match csr_addr {
+                    CSR_FFLAGS => self.fpu.fflags.to_bits(),
+                    CSR_FRM => self.fpu.frm as u32,
+                    CSR_FCSR => self.fpu.read_fcsr(),
+                    _ => self.csr.read(csr_addr, self.priv_level)
+                        .ok_or(Trap::IllegalInstruction(inst))?,
+                };
                 
                 // Calculate new value based on operation
                 let new_val = match d.funct3 & 0x3 {
@@ -394,8 +417,25 @@ impl Cpu {
                 
                 // Write new value (unless rs1 == 0 for RS/RC)
                 if d.funct3 & 0x3 == 0b01 || rs1_val != 0 {
-                    if !self.csr.write(csr_addr, new_val, self.priv_level) {
-                        return Err(Trap::IllegalInstruction(inst));
+                    match csr_addr {
+                        CSR_FFLAGS => {
+                            self.fpu.fflags = crate::cpu::fpu::FFlags::from_bits(new_val & 0x1F);
+                            // Set FS to dirty
+                            self.csr.mstatus |= MSTATUS_FS;
+                        }
+                        CSR_FRM => {
+                            self.fpu.frm = crate::cpu::fpu::RoundingMode::from(new_val);
+                            self.csr.mstatus |= MSTATUS_FS;
+                        }
+                        CSR_FCSR => {
+                            self.fpu.write_fcsr(new_val);
+                            self.csr.mstatus |= MSTATUS_FS;
+                        }
+                        _ => {
+                            if !self.csr.write(csr_addr, new_val, self.priv_level) {
+                                return Err(Trap::IllegalInstruction(inst));
+                            }
+                        }
                     }
                 }
                 

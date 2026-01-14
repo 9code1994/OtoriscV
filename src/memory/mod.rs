@@ -80,6 +80,8 @@ pub trait Bus {
     fn write16(&mut self, addr: u32, value: u16);
     fn read32(&mut self, addr: u32) -> u32;
     fn write32(&mut self, addr: u32, value: u32);
+    fn read64(&mut self, addr: u32) -> u64;
+    fn write64(&mut self, addr: u32, value: u64);
 }
 
 impl Bus for Memory {
@@ -105,6 +107,14 @@ impl Bus for Memory {
     
     fn write32(&mut self, addr: u32, value: u32) {
         Memory::write32(self, addr, value)
+    }
+    
+    fn read64(&mut self, addr: u32) -> u64 {
+        Memory::read64(self, addr)
+    }
+    
+    fn write64(&mut self, addr: u32, value: u64) {
+        Memory::write64(self, addr, value)
     }
 }
 
@@ -411,6 +421,51 @@ impl Memory {
         self.write8(addr + 1, (value >> 8) as u8);
         self.write8(addr + 2, (value >> 16) as u8);
         self.write8(addr + 3, (value >> 24) as u8);
+    }
+    
+    /// Read 64 bits (little endian) - needed for RV64 and FLD
+    pub fn read64(&self, addr: u32) -> u64 {
+        // Check RAM (fast path)
+        if addr >= self.ram_base && addr + 7 < self.ram_base + self.ram.len() as u32 {
+            let offset = (addr - self.ram_base) as usize;
+            return u64::from_le_bytes([
+                self.ram[offset],
+                self.ram[offset + 1],
+                self.ram[offset + 2],
+                self.ram[offset + 3],
+                self.ram[offset + 4],
+                self.ram[offset + 5],
+                self.ram[offset + 6],
+                self.ram[offset + 7],
+            ]);
+        }
+        
+        // Fallback to two 32-bit reads
+        let lo = self.read32(addr) as u64;
+        let hi = self.read32(addr + 4) as u64;
+        lo | (hi << 32)
+    }
+    
+    /// Write 64 bits (little endian) - needed for RV64 and FSD
+    pub fn write64(&mut self, addr: u32, value: u64) {
+        // Check RAM (fast path)
+        if addr >= self.ram_base && addr + 7 < self.ram_base + self.ram.len() as u32 {
+            let offset = (addr - self.ram_base) as usize;
+            let bytes = value.to_le_bytes();
+            self.ram[offset] = bytes[0];
+            self.ram[offset + 1] = bytes[1];
+            self.ram[offset + 2] = bytes[2];
+            self.ram[offset + 3] = bytes[3];
+            self.ram[offset + 4] = bytes[4];
+            self.ram[offset + 5] = bytes[5];
+            self.ram[offset + 6] = bytes[6];
+            self.ram[offset + 7] = bytes[7];
+            return;
+        }
+        
+        // Fallback to two 32-bit writes
+        self.write32(addr, value as u32);
+        self.write32(addr + 4, (value >> 32) as u32);
     }
     
     pub fn reset(&mut self) {

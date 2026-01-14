@@ -188,7 +188,6 @@ impl Uart {
                 if self.is_dlab_set() {
                     self.divisor = (self.divisor & 0x00FF) | ((value as u16) << 8);
                 } else {
-                    let old_ier = self.ier;
                     self.ier = value & 0x0F;
                     // Writing to IER clears THRI flag (as per jor1k behavior)
                     self.interrupt_flags &= !IIR_TX_EMPTY;

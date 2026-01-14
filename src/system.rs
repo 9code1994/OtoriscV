@@ -596,6 +596,31 @@ impl<'a> Bus for SystemBus<'a> {
         // Default to memory
         self.memory.write32(addr, value);
     }
+    
+    fn read64(&mut self, addr: u32) -> u64 {
+        // CLINT has 64-bit registers (mtime, mtimecmp)
+        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+            let lo = self.clint.read32(addr - CLINT_BASE) as u64;
+            let hi = self.clint.read32(addr - CLINT_BASE + 4) as u64;
+            return lo | (hi << 32);
+        }
+        // Default: compose from two 32-bit reads (for RAM and other devices)
+        let lo = self.read32(addr) as u64;
+        let hi = self.read32(addr + 4) as u64;
+        lo | (hi << 32)
+    }
+    
+    fn write64(&mut self, addr: u32, value: u64) {
+        // CLINT has 64-bit registers (mtime, mtimecmp)
+        if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
+            self.clint.write32(addr - CLINT_BASE, value as u32);
+            self.clint.write32(addr - CLINT_BASE + 4, (value >> 32) as u32);
+            return;
+        }
+        // Default: decompose into two 32-bit writes
+        self.write32(addr, value as u32);
+        self.write32(addr + 4, (value >> 32) as u32);
+    }
 }
 
 #[cfg(test)]
@@ -611,9 +636,10 @@ mod tests {
         // Should succeed
         sys.setup_linux_boot(&dummy_kernel, "console=ttyS0").unwrap();
         
-        // registers should be set
-        assert_eq!(sys.cpu.pc, DRAM_BASE);
-        assert_eq!(sys.cpu.read_reg(10), 0); // a0
+        // CPU starts in boot ROM (0x1000), which will MRET to kernel
+        // PC is reset to boot ROM, not directly to kernel
+        assert_eq!(sys.cpu.pc, 0x1000); // Boot ROM address
+        assert_eq!(sys.cpu.read_reg(10), 0); // a0 = hartid
         
         // DTB should be at end of RAM (aligned)
         let dtb_addr = sys.cpu.read_reg(11); // a1

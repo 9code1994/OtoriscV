@@ -2,7 +2,7 @@
 //!
 //! Based on jor1k's safecpu.js CSR implementation
 
-use super::PrivilegeLevel;
+use crate::cpu::PrivilegeLevel;
 use serde::{Serialize, Deserialize};
 
 // CSR addresses
@@ -124,9 +124,9 @@ pub struct Csr {
 impl Csr {
     pub fn new() -> Self {
         Csr {
-            // MISA: RV32IMA (I=8, M=12, A=0, 32-bit=1<<30)
-            misa: (1 << 30) | (1 << 8) | (1 << 12) | (1 << 0) | (1 << 18), // I M A S
-            mstatus: 0,
+            // MISA: RV32IMAFD (I=8, M=12, A=0, F=5, D=3, S=18, 32-bit=1<<30)
+            misa: (1 << 30) | (1 << 8) | (1 << 12) | (1 << 0) | (1 << 18) | (1 << 5) | (1 << 3), // I M A S F D
+            mstatus: MSTATUS_FS, // Enable FPU by default (FS = Initial)
             medeleg: 0,
             mideleg: 0,
             mie: 0,
@@ -192,7 +192,7 @@ impl Csr {
             CSR_TIME => self.time as u32,
             CSR_TIMEH => (self.time >> 32) as u32,
             
-            CSR_FCSR | CSR_FFLAGS | CSR_FRM => 0, // FPU not implemented
+            CSR_FCSR | CSR_FFLAGS | CSR_FRM => 0, // FPU CSRs handled via CPU.fpu
             
             _ => 0, // Unknown CSR returns 0
         })

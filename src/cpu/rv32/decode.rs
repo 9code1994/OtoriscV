@@ -1,6 +1,6 @@
 //! Instruction decoder
 //!
-//! Decodes RV32IMA instructions
+//! Decodes RV32IMAFD instructions
 
 /// Decoded instruction fields
 #[derive(Debug)]
@@ -9,6 +9,7 @@ pub struct DecodedInst {
     pub rd: u32,
     pub rs1: u32,
     pub rs2: u32,
+    pub rs3: u32,     // For R4-type (fused multiply-add)
     pub funct3: u32,
     pub funct7: u32,
     pub imm_i: i32,
@@ -25,6 +26,7 @@ impl DecodedInst {
         let rd = (inst >> 7) & 0x1F;
         let rs1 = (inst >> 15) & 0x1F;
         let rs2 = (inst >> 20) & 0x1F;
+        let rs3 = (inst >> 27) & 0x1F;  // For R4-type (fused multiply-add)
         let funct3 = (inst >> 12) & 0x7;
         let funct7 = (inst >> 25) & 0x7F;
         
@@ -54,6 +56,7 @@ impl DecodedInst {
             rd,
             rs1,
             rs2,
+            rs3,
             funct3,
             funct7,
             imm_i,
@@ -78,6 +81,15 @@ pub const OP_OP: u32 = 0b0110011;
 pub const OP_MISC_MEM: u32 = 0b0001111;
 pub const OP_SYSTEM: u32 = 0b1110011;
 pub const OP_AMO: u32 = 0b0101111;
+
+// Floating-point opcodes (F and D extensions)
+pub const OP_LOAD_FP: u32 = 0b0000111;   // FLW, FLD
+pub const OP_STORE_FP: u32 = 0b0100111;  // FSW, FSD
+pub const OP_MADD: u32 = 0b1000011;      // FMADD.S, FMADD.D
+pub const OP_MSUB: u32 = 0b1000111;      // FMSUB.S, FMSUB.D
+pub const OP_NMSUB: u32 = 0b1001011;     // FNMSUB.S, FNMSUB.D
+pub const OP_NMADD: u32 = 0b1001111;     // FNMADD.S, FNMADD.D
+pub const OP_OP_FP: u32 = 0b1010011;     // All other FP operations
 
 // Branch funct3
 pub const FUNCT3_BEQ: u32 = 0b000;
@@ -135,3 +147,54 @@ pub const FUNCT5_AMOMIN: u32 = 0b10000;
 pub const FUNCT5_AMOMAX: u32 = 0b10100;
 pub const FUNCT5_AMOMINU: u32 = 0b11000;
 pub const FUNCT5_AMOMAXU: u32 = 0b11100;
+
+// FP funct3 (width specifier for LOAD_FP/STORE_FP)
+pub const FUNCT3_FLW: u32 = 0b010;   // Single-precision (32-bit)
+pub const FUNCT3_FLD: u32 = 0b011;   // Double-precision (64-bit)
+
+// FP funct7 (operation encoding for OP_FP)
+pub const FUNCT7_FADD_S: u32 = 0b0000000;
+pub const FUNCT7_FSUB_S: u32 = 0b0000100;
+pub const FUNCT7_FMUL_S: u32 = 0b0001000;
+pub const FUNCT7_FDIV_S: u32 = 0b0001100;
+pub const FUNCT7_FSQRT_S: u32 = 0b0101100;
+pub const FUNCT7_FSGNJ_S: u32 = 0b0010000;  // FSGNJ/FSGNJN/FSGNJX via funct3
+pub const FUNCT7_FMIN_S: u32 = 0b0010100;   // FMIN/FMAX via funct3
+pub const FUNCT7_FCVT_W_S: u32 = 0b1100000; // FCVT.W.S / FCVT.WU.S
+pub const FUNCT7_FMV_X_W: u32 = 0b1110000;  // FMV.X.W / FCLASS.S
+pub const FUNCT7_FCMP_S: u32 = 0b1010000;   // FEQ/FLT/FLE via funct3
+pub const FUNCT7_FCVT_S_W: u32 = 0b1101000; // FCVT.S.W / FCVT.S.WU
+pub const FUNCT7_FMV_W_X: u32 = 0b1111000;  // FMV.W.X
+
+// D extension funct7
+pub const FUNCT7_FADD_D: u32 = 0b0000001;
+pub const FUNCT7_FSUB_D: u32 = 0b0000101;
+pub const FUNCT7_FMUL_D: u32 = 0b0001001;
+pub const FUNCT7_FDIV_D: u32 = 0b0001101;
+pub const FUNCT7_FSQRT_D: u32 = 0b0101101;
+pub const FUNCT7_FSGNJ_D: u32 = 0b0010001;
+pub const FUNCT7_FMIN_D: u32 = 0b0010101;
+pub const FUNCT7_FCVT_S_D: u32 = 0b0100000; // FCVT.S.D
+pub const FUNCT7_FCVT_D_S: u32 = 0b0100001; // FCVT.D.S
+pub const FUNCT7_FCVT_W_D: u32 = 0b1100001; // FCVT.W.D / FCVT.WU.D
+pub const FUNCT7_FCMP_D: u32 = 0b1010001;   // FEQ/FLT/FLE via funct3
+pub const FUNCT7_FCLASS_D: u32 = 0b1110001; // FCLASS.D
+pub const FUNCT7_FCVT_D_W: u32 = 0b1101001; // FCVT.D.W / FCVT.D.WU
+
+// FP funct3 for sign injection
+pub const FUNCT3_FSGNJ: u32 = 0b000;
+pub const FUNCT3_FSGNJN: u32 = 0b001;
+pub const FUNCT3_FSGNJX: u32 = 0b010;
+
+// FP funct3 for min/max
+pub const FUNCT3_FMIN: u32 = 0b000;
+pub const FUNCT3_FMAX: u32 = 0b001;
+
+// FP funct3 for comparison
+pub const FUNCT3_FEQ: u32 = 0b010;
+pub const FUNCT3_FLT: u32 = 0b001;
+pub const FUNCT3_FLE: u32 = 0b000;
+
+// FP fmt field (for fused multiply-add, bits [26:25])
+pub const FMT_S: u32 = 0b00;  // Single-precision
+pub const FMT_D: u32 = 0b01;  // Double-precision

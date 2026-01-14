@@ -3,8 +3,8 @@
 //! Handles virtual address translation for 32-bit RISC-V.
 //! Supports 4KB pages and 4MB megapages.
 
+use crate::cpu::PrivilegeLevel;
 use crate::memory::Bus;
-use super::PrivilegeLevel;
 
 /// Access type for translation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
