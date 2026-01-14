@@ -1,12 +1,12 @@
-//! Basic Block JIT Compilation
+//! Basic Block JIT Compilation (v1)
 //!
 //! Compiles sequences of instructions into blocks that execute together,
 //! reducing the per-instruction overhead of interpretation.
 
 use std::collections::HashMap;
-use super::Cpu;
-use super::icache::CachedInst;
-use super::decode::*;
+use crate::cpu::Cpu;
+use super::super::icache::CachedInst;
+use super::super::decode::*;
 use crate::memory::Bus;
 use crate::cpu::trap::Trap;
 

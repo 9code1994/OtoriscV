@@ -10,14 +10,13 @@ mod execute;
 mod execute_fp;
 pub mod mmu;
 pub mod icache;
-pub mod bb_jit;
-pub mod bb_jit_v2;
+pub mod jit;
 pub mod run_fast;
 
 pub use csr::Csr;
 pub use mmu::Mmu;
 pub use icache::{ICache, CachedInst};
-pub use bb_jit::{BlockCache, BlockResult, execute_block};
+pub use jit::{BlockCache, BlockResult, execute_block};
 pub use run_fast::run_fast as run_fast_loop;
 
 use super::PrivilegeLevel;

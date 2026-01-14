@@ -5,7 +5,7 @@
 use crate::cpu::Cpu;
 use crate::cpu::csr::*;
 use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType, run_fast_loop};
-use crate::cpu::rv32::bb_jit_v2::{JitState, RegionResult, execute_region, HEAT_PER_BLOCK, Page};
+use crate::cpu::rv32::jit::{JitState, RegionResult, execute_region, HEAT_PER_BLOCK, Page};
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
 use crate::devices::virtio_9p::{Backend, in_memory::InMemoryFileSystem};
