@@ -187,8 +187,19 @@ impl System {
                 if pending != 0 {
                     self.cpu.wfi = false;
                     // The interrupt will be handled on next iteration
-                    // (or the kernel will poll and see data available)
                 } else {
+                    // Fast-forward to next timer interrupt instead of spinning
+                    let ticks_to_timer = self.clint.ticks_until_interrupt();
+                    if ticks_to_timer > 0 {
+                        // Skip directly to timer, but don't exceed max_cycles
+                        let skip = ticks_to_timer.min((max_cycles - cycles) as u64) as u32;
+                        if skip > 1 {
+                            self.clint.tick(skip as u64);
+                            self.cpu.csr.time = self.clint.get_mtime();
+                            cycles += skip;
+                            continue;
+                        }
+                    }
                     cycles += 1;
                     continue;
                 }

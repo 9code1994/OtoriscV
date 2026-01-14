@@ -58,6 +58,16 @@ impl Clint {
     pub fn get_mtimecmp(&self) -> u64 {
         self.mtimecmp
     }
+
+    /// Get ticks until next timer interrupt
+    /// Returns 0 if already pending or mtimecmp is MAX (no timer set)
+    #[inline]
+    pub fn ticks_until_interrupt(&self) -> u64 {
+        if self.timer_interrupt || self.mtimecmp == u64::MAX {
+            return 0;
+        }
+        self.mtimecmp.saturating_sub(self.mtime)
+    }
     
     /// Check if timer interrupt should fire
     fn check_timer(&mut self) {
