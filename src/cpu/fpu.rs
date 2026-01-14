@@ -480,6 +480,76 @@ pub fn f32_to_u32(a: u32, rm: RoundingMode) -> (u32, FFlags) {
     (result, flags)
 }
 
+/// f32 to i64 conversion
+pub fn f32_to_i64(a: u32, rm: RoundingMode) -> (i64, FFlags) {
+    let af = f32::from_bits(a);
+    let mut flags = FFlags::default();
+
+    if af.is_nan() {
+        flags.nv = true;
+        return (i64::MAX, flags);
+    }
+
+    if af >= (i64::MAX as f32) {
+        flags.nv = true;
+        return (i64::MAX, flags);
+    }
+
+    if af <= (i64::MIN as f32) {
+        flags.nv = true;
+        return (i64::MIN, flags);
+    }
+
+    let result = match rm {
+        RoundingMode::RTZ => af.trunc() as i64,
+        RoundingMode::RDN => af.floor() as i64,
+        RoundingMode::RUP => af.ceil() as i64,
+        RoundingMode::RNE | RoundingMode::RMM => af.round() as i64,
+        RoundingMode::DYN => af.round() as i64,
+    };
+
+    if (result as f32) != af {
+        flags.nx = true;
+    }
+
+    (result, flags)
+}
+
+/// f32 to u64 conversion
+pub fn f32_to_u64(a: u32, rm: RoundingMode) -> (u64, FFlags) {
+    let af = f32::from_bits(a);
+    let mut flags = FFlags::default();
+
+    if af.is_nan() {
+        flags.nv = true;
+        return (u64::MAX, flags);
+    }
+
+    if af >= (u64::MAX as f32) {
+        flags.nv = true;
+        return (u64::MAX, flags);
+    }
+
+    if af < 0.0 {
+        flags.nv = true;
+        return (0, flags);
+    }
+
+    let result = match rm {
+        RoundingMode::RTZ => af.trunc() as u64,
+        RoundingMode::RDN => af.floor() as u64,
+        RoundingMode::RUP => af.ceil() as u64,
+        RoundingMode::RNE | RoundingMode::RMM => af.round() as u64,
+        RoundingMode::DYN => af.round() as u64,
+    };
+
+    if (result as f32) != af {
+        flags.nx = true;
+    }
+
+    (result, flags)
+}
+
 /// i32 to f32 conversion
 pub fn i32_to_f32(a: i32, _rm: RoundingMode) -> (u32, FFlags) {
     let result = a as f32;
@@ -502,6 +572,26 @@ pub fn u32_to_f32(a: u32, _rm: RoundingMode) -> (u32, FFlags) {
         flags.nx = true;
     }
     
+    (result.to_bits(), flags)
+}
+
+/// i64 to f32 conversion
+pub fn i64_to_f32(a: i64, _rm: RoundingMode) -> (u32, FFlags) {
+    let result = a as f32;
+    let mut flags = FFlags::default();
+    if (result as i64) != a {
+        flags.nx = true;
+    }
+    (result.to_bits(), flags)
+}
+
+/// u64 to f32 conversion
+pub fn u64_to_f32(a: u64, _rm: RoundingMode) -> (u32, FFlags) {
+    let result = a as f32;
+    let mut flags = FFlags::default();
+    if (result as u64) != a {
+        flags.nx = true;
+    }
     (result.to_bits(), flags)
 }
 
@@ -848,6 +938,74 @@ pub fn f64_to_u32(a: u64, rm: RoundingMode) -> (u32, FFlags) {
     (result, flags)
 }
 
+/// f64 to i64 conversion
+pub fn f64_to_i64(a: u64, rm: RoundingMode) -> (i64, FFlags) {
+    let af = f64::from_bits(a);
+    let mut flags = FFlags::default();
+
+    if af.is_nan() {
+        flags.nv = true;
+        return (i64::MAX, flags);
+    }
+
+    if af >= (i64::MAX as f64) + 1.0 {
+        flags.nv = true;
+        return (i64::MAX, flags);
+    }
+
+    if af < (i64::MIN as f64) {
+        flags.nv = true;
+        return (i64::MIN, flags);
+    }
+
+    let result = match rm {
+        RoundingMode::RTZ => af.trunc() as i64,
+        RoundingMode::RDN => af.floor() as i64,
+        RoundingMode::RUP => af.ceil() as i64,
+        _ => af.round() as i64,
+    };
+
+    if (result as f64) != af {
+        flags.nx = true;
+    }
+
+    (result, flags)
+}
+
+/// f64 to u64 conversion
+pub fn f64_to_u64(a: u64, rm: RoundingMode) -> (u64, FFlags) {
+    let af = f64::from_bits(a);
+    let mut flags = FFlags::default();
+
+    if af.is_nan() {
+        flags.nv = true;
+        return (u64::MAX, flags);
+    }
+
+    if af >= (u64::MAX as f64) + 1.0 {
+        flags.nv = true;
+        return (u64::MAX, flags);
+    }
+
+    if af < 0.0 {
+        flags.nv = true;
+        return (0, flags);
+    }
+
+    let result = match rm {
+        RoundingMode::RTZ => af.trunc() as u64,
+        RoundingMode::RDN => af.floor() as u64,
+        RoundingMode::RUP => af.ceil() as u64,
+        _ => af.round() as u64,
+    };
+
+    if (result as f64) != af {
+        flags.nx = true;
+    }
+
+    (result, flags)
+}
+
 /// i32 to f64 conversion (always exact)
 pub fn i32_to_f64(a: i32) -> u64 {
     (a as f64).to_bits()
@@ -856,6 +1014,26 @@ pub fn i32_to_f64(a: i32) -> u64 {
 /// u32 to f64 conversion (always exact)
 pub fn u32_to_f64(a: u32) -> u64 {
     (a as f64).to_bits()
+}
+
+/// i64 to f64 conversion
+pub fn i64_to_f64(a: i64) -> (u64, FFlags) {
+    let result = a as f64;
+    let mut flags = FFlags::default();
+    if (result as i64) != a {
+        flags.nx = true;
+    }
+    (result.to_bits(), flags)
+}
+
+/// u64 to f64 conversion
+pub fn u64_to_f64(a: u64) -> (u64, FFlags) {
+    let result = a as f64;
+    let mut flags = FFlags::default();
+    if (result as u64) != a {
+        flags.nx = true;
+    }
+    (result.to_bits(), flags)
 }
 
 /// f32 to f64 conversion
