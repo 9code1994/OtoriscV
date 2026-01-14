@@ -189,6 +189,16 @@ impl System {
                     // The interrupt will be handled on next iteration
                     // (or the kernel will poll and see data available)
                 } else {
+                    let ticks = self.clint.ticks_until_interrupt();
+                    if ticks > 0 {
+                        let skip = ticks.min((max_cycles - cycles) as u64);
+                        if skip > 0 {
+                            self.clint.tick(skip);
+                            self.cpu.csr.time = self.clint.get_mtime();
+                            cycles += skip as u32;
+                            continue;
+                        }
+                    }
                     cycles += 1;
                     continue;
                 }
