@@ -4,7 +4,7 @@
 
 use crate::cpu::Cpu;
 use crate::cpu::csr::*;
-use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType, run_inline_switch_loop};
+use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType};
 use crate::cpu::rv32::jit::{JitState, RegionResult, execute_region, HEAT_PER_BLOCK, Page};
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
@@ -88,7 +88,7 @@ impl System {
             virtio9p: Virtio9p::new("rootfs", fs_backend),
             block_cache: BlockCache::new(),
             jit_state: JitState::new(),
-            use_jit_v2: false,  // JIT v2 has bugs, use v1 by default
+            use_jit_v2: false,  // Disabled by default, enable with --jit-v2 flag
         })
     }
     
@@ -270,72 +270,21 @@ impl System {
         cycles
     }
     
-    /// Run with giant inline switch (jor1k-style direct interpretation)
-    /// With JIT v2 integration: checks for hot compiled regions before inline switch
-    pub fn run_inline_switch(&mut self, max_cycles: u32) -> u32 {
-        let mut total_cycles = 0u32;
-        let mut remaining = max_cycles;
-        
-        while remaining > 0 {
-            // Check cache invalidation request
-            if self.cpu.cache_invalidation_pending {
-                self.jit_state.invalidate_all();
-                self.cpu.cache_invalidation_pending = false;
-            }
-            
-            // UGLY JIT v2 integration: Try JIT execution first if available
-            if self.use_jit_v2 {
-                if let Some(jit_cycles) = self.try_jit_execution() {
-                    total_cycles += jit_cycles;
-                    remaining = remaining.saturating_sub(jit_cycles);
-                    
-                    // Handle pending SBI call from JIT
-                    if self.cpu.pending_sbi_call {
-                        self.cpu.pending_sbi_call = false;
-                        self.handle_sbi_call();
-                    }
-                    continue;
-                }
-            }
-            
-            let cycles = run_inline_switch_loop(
-                &mut self.cpu,
-                &mut self.memory,
-                &mut self.uart,
-                &mut self.clint,
-                &mut self.plic,
-                &mut self.virtio9p,
-                remaining,
-            );
-            
-            total_cycles += cycles;
-            remaining = remaining.saturating_sub(cycles);
-            
-            // Handle pending SBI call
-            if self.cpu.pending_sbi_call {
-                self.cpu.pending_sbi_call = false;
-                self.handle_sbi_call();
-                // Continue looping after SBI
-            }
-            
-            // If cycles == 0, CPU is halted (WFI) - break out
-            if cycles == 0 {
-                break;
-            }
-        }
-        
-        total_cycles
-    }
-    
     /// Try to execute using JIT v2 compiled region
     /// Returns Some(cycles) if JIT execution happened, None if no JIT region available
+    /// 
+    /// Uses VIRTUAL addresses throughout - no PA translation needed for JIT.
     fn try_jit_execution(&mut self) -> Option<u32> {
-        // Translate PC to physical address
         let satp = self.cpu.csr.satp;
-        let mstatus = self.cpu.csr.mstatus;
-        let priv_level = self.cpu.priv_level;
         
-        // Create bus for translation and execution
+        // Check if SATP changed - invalidate JIT cache on page table switch
+        self.jit_state.check_satp(satp);
+        
+        // Use VIRTUAL address directly
+        let vaddr = self.cpu.pc;
+        let page = Page::of(vaddr);
+        
+        // Create bus for execution
         let mut bus = SystemBus::new(
             &mut self.memory,
             &mut self.uart,
@@ -344,28 +293,15 @@ impl System {
             &mut self.virtio9p,
         );
         
-        let paddr = match self.cpu.mmu.translate(
-            self.cpu.pc, 
-            AccessType::Instruction, 
-            priv_level, 
-            &mut bus, 
-            satp, 
-            mstatus
-        ) {
-            Ok(pa) => pa,
-            Err(_) => return None, // Let inline switch handle the page fault
-        };
-        
-        // Record execution for hotness tracking
-        let page = Page::of(paddr);
-        if let Some(hot_page) = self.jit_state.record_execution(paddr, HEAT_PER_BLOCK) {
+        // Record execution for hotness tracking (using VA)
+        if let Some(hot_page) = self.jit_state.record_execution(vaddr, HEAT_PER_BLOCK) {
             // Page became hot - compile the region
             self.jit_state.compile_region(&mut bus, hot_page);
         }
         
         // Try to execute using compiled region
         if let Some(region) = self.jit_state.get_region(page) {
-            // Execute the compiled region
+            // Execute the compiled region (uses VA directly)
             match execute_region(&mut self.cpu, &mut bus, region) {
                 RegionResult::Continue(next_pc) => {
                     self.cpu.pc = next_pc;
@@ -496,13 +432,20 @@ impl System {
     }
     
     /// Execute using JIT v2 (page-based with CFG optimization)
+    /// 
+    /// JIT v2 uses VIRTUAL addresses throughout. The cache is invalidated
+    /// when SATP changes (page table switch) or on SFENCE.VMA.
     fn step_block_v2(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
-        // Translate PC to physical address
         let satp = self.cpu.csr.satp;
-        let mstatus = self.cpu.csr.mstatus;
-        let priv_level = self.cpu.priv_level;
         
-        // Create bus for translation
+        // Check if SATP changed - invalidate JIT cache on page table switch
+        self.jit_state.check_satp(satp);
+        
+        // Use VIRTUAL address directly for JIT v2
+        let vaddr = self.cpu.pc;
+        let page = Page::of(vaddr);
+        
+        // Create bus for instruction fetch and execution
         let mut bus = SystemBus::new(
             &mut self.memory,
             &mut self.uart,
@@ -511,30 +454,16 @@ impl System {
             &mut self.virtio9p,
         );
         
-        let paddr = match self.cpu.mmu.translate(
-            self.cpu.pc, 
-            AccessType::Instruction, 
-            priv_level, 
-            &mut bus, 
-            satp, 
-            mstatus
-        ) {
-            Ok(pa) => pa,
-            Err(cause) => {
-                return Err(crate::cpu::trap::Trap::from_cause(cause, self.cpu.pc));
-            }
-        };
-        
-        // Record execution for hotness tracking
-        let page = Page::of(paddr);
-        if let Some(hot_page) = self.jit_state.record_execution(paddr, HEAT_PER_BLOCK) {
+        // Record execution for hotness tracking (using VA)
+        if let Some(hot_page) = self.jit_state.record_execution(vaddr, HEAT_PER_BLOCK) {
             // Page became hot - compile the region
+            // Note: Bus reads will go through MMU translation
             self.jit_state.compile_region(&mut bus, hot_page);
         }
         
         // Try to execute using compiled region
         if let Some(region) = self.jit_state.get_region(page) {
-            // Execute the compiled region
+            // Execute the compiled region (uses VA directly)
             match execute_region(&mut self.cpu, &mut bus, region) {
                 RegionResult::Continue(next_pc) => {
                     self.cpu.pc = next_pc;

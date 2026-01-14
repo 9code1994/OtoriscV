@@ -1,4 +1,7 @@
 //! Basic block discovery
+//!
+//! Discovers basic blocks using VIRTUAL addresses.
+//! The bus handles VA→PA translation when reading instructions.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use super::types::{BasicBlock, BasicBlockType, BranchCondition, Page};
@@ -42,7 +45,8 @@ fn extract_jal_offset(inst: u32) -> i32 {
 
 /// Discover basic blocks starting from entry points
 ///
-/// Returns a map from physical address to BasicBlock
+/// All addresses are VIRTUAL addresses. The bus handles VA→PA translation.
+/// Returns a map from virtual address to BasicBlock.
 pub fn discover_basic_blocks(
     bus: &mut impl Bus,
     page: Page,
@@ -55,37 +59,39 @@ pub fn discover_basic_blocks(
     let page_base = page.base_addr();
     let page_end = page_base + 0x1000;
 
-    while let Some(start_addr) = worklist.pop_front() {
+    while let Some(start_vaddr) = worklist.pop_front() {
         // Skip if already processed or outside page
-        if visited.contains(&start_addr) || start_addr < page_base || start_addr >= page_end {
+        if visited.contains(&start_vaddr) || start_vaddr < page_base || start_vaddr >= page_end {
             continue;
         }
-        visited.insert(start_addr);
+        visited.insert(start_vaddr);
 
         let mut instructions = Vec::with_capacity(16);
-        let mut addr = start_addr;
+        let mut vaddr = start_vaddr;
 
         // Scan instructions until terminator or limit
         loop {
             // Check page boundary
-            if addr >= page_end {
+            if vaddr >= page_end {
                 break;
             }
 
-            let inst = bus.read32(addr);
+            // Read instruction via bus (which handles VA→PA translation)
+            let inst = bus.read32(vaddr);
             let cached = CachedInst::decode(inst);
             let opcode = cached.opcode;
             instructions.push(cached);
 
-            let next_addr = addr + 4;
+            let next_vaddr = vaddr + 4;
             let is_terminator = is_block_terminator(opcode);
 
             if is_terminator {
-                // Determine block type and successors
+                // Determine block type and successors (all targets are VIRTUAL addresses)
                 let block_type = match opcode as u32 {
                     OP_BRANCH => {
                         let offset = extract_branch_offset(inst);
-                        let target = (addr as i32).wrapping_add(offset) as u32;
+                        // Target is computed from current VA + offset
+                        let target = (vaddr as i32).wrapping_add(offset) as u32;
                         let condition = BranchCondition::from_instruction(inst)
                             .expect("Invalid branch instruction");
 
@@ -96,9 +102,9 @@ pub fn discover_basic_blocks(
                         } else {
                             None
                         };
-                        let not_taken = if page.contains(next_addr) {
-                            worklist.push_back(next_addr);
-                            Some(next_addr)
+                        let not_taken = if page.contains(next_vaddr) {
+                            worklist.push_back(next_vaddr);
+                            Some(next_vaddr)
                         } else {
                             None
                         };
@@ -113,24 +119,25 @@ pub fn discover_basic_blocks(
                     OP_JAL => {
                         let rd = ((inst >> 7) & 0x1F) as u8;
                         let offset = extract_jal_offset(inst);
-                        let target = (addr as i32).wrapping_add(offset) as u32;
+                        // Target is computed from current VA + offset
+                        let target = (vaddr as i32).wrapping_add(offset) as u32;
 
                         if rd == 0 {
                             // Unconditional jump (tail call)
-                            let target_addr = if page.contains(target) {
+                            let target_vaddr = if page.contains(target) {
                                 worklist.push_back(target);
                                 Some(target)
                             } else {
                                 None
                             };
                             BasicBlockType::Jump {
-                                target: target_addr,
+                                target: target_vaddr,
                                 offset,
                             }
                         } else {
                             // Call - return address is next instruction
-                            if page.contains(next_addr) {
-                                worklist.push_back(next_addr);
+                            if page.contains(next_vaddr) {
+                                worklist.push_back(next_vaddr);
                             }
                             if page.contains(target) {
                                 worklist.push_back(target);
@@ -151,54 +158,54 @@ pub fn discover_basic_blocks(
                 };
 
                 let block = BasicBlock {
-                    addr: start_addr,
-                    end_addr: next_addr,
+                    addr: start_vaddr,
+                    end_addr: next_vaddr,
                     instructions,
                     ty: block_type,
-                    is_entry_point: entry_points.contains(&start_addr),
+                    is_entry_point: entry_points.contains(&start_vaddr),
                 };
-                blocks.insert(start_addr, block);
+                blocks.insert(start_vaddr, block);
                 break;
             }
 
             // Check if we've hit an existing block start
-            if visited.contains(&next_addr) {
+            if visited.contains(&next_vaddr) {
                 let block = BasicBlock {
-                    addr: start_addr,
-                    end_addr: next_addr,
+                    addr: start_vaddr,
+                    end_addr: next_vaddr,
                     instructions,
                     ty: BasicBlockType::Fallthrough {
-                        next: Some(next_addr),
+                        next: Some(next_vaddr),
                     },
-                    is_entry_point: entry_points.contains(&start_addr),
+                    is_entry_point: entry_points.contains(&start_vaddr),
                 };
-                blocks.insert(start_addr, block);
+                blocks.insert(start_vaddr, block);
                 break;
             }
 
             // Check block size limit
             if instructions.len() >= MAX_BLOCK_SIZE {
-                if page.contains(next_addr) {
-                    worklist.push_back(next_addr);
+                if page.contains(next_vaddr) {
+                    worklist.push_back(next_vaddr);
                 }
                 let block = BasicBlock {
-                    addr: start_addr,
-                    end_addr: next_addr,
+                    addr: start_vaddr,
+                    end_addr: next_vaddr,
                     instructions,
                     ty: BasicBlockType::Fallthrough {
-                        next: if page.contains(next_addr) {
-                            Some(next_addr)
+                        next: if page.contains(next_vaddr) {
+                            Some(next_vaddr)
                         } else {
                             None
                         },
                     },
-                    is_entry_point: entry_points.contains(&start_addr),
+                    is_entry_point: entry_points.contains(&start_vaddr),
                 };
-                blocks.insert(start_addr, block);
+                blocks.insert(start_vaddr, block);
                 break;
             }
 
-            addr = next_addr;
+            vaddr = next_vaddr;
         }
     }
 

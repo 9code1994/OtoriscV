@@ -1,4 +1,7 @@
 //! Region execution
+//!
+//! Executes compiled regions using VIRTUAL addresses.
+//! All block lookups use cpu.pc (VA) directly.
 
 use std::collections::HashMap;
 use super::types::{BasicBlock, BasicBlockType, ControlFlowStructure, Page, RegionResult, CompiledRegion};
@@ -9,7 +12,7 @@ use crate::memory::Bus;
 /// Maximum loop iterations before forcing exit (prevents infinite loops in JIT)
 const MAX_LOOP_ITERATIONS: u32 = 10000;
 
-/// Execute a single basic block and return next PC
+/// Execute a single basic block and return next PC (virtual address)
 #[inline(always)]
 fn execute_basic_block(
     cpu: &mut Cpu,
@@ -21,7 +24,7 @@ fn execute_basic_block(
         cpu.execute_cached(cached.raw, cached, bus)?;
     }
     
-    // Determine next PC based on terminator
+    // Determine next PC based on terminator (returns VA)
     match &block.ty {
         BasicBlockType::Fallthrough { next } => {
             Ok(next.unwrap_or(cpu.pc))
@@ -42,8 +45,7 @@ fn execute_basic_block(
 
 /// Execute structured control flow recursively
 /// 
-/// This is the native code generation equivalent - we execute the structured
-/// control flow directly in Rust, allowing the compiler to optimize loops.
+/// All addresses are VIRTUAL. Block lookups use VA directly.
 fn execute_structure(
     cpu: &mut Cpu,
     bus: &mut impl Bus,
@@ -53,8 +55,8 @@ fn execute_structure(
 ) -> RegionResult {
     for node in structure {
         match node {
-            ControlFlowStructure::Block(addr) => {
-                if let Some(block) = blocks.get(addr) {
+            ControlFlowStructure::Block(vaddr) => {
+                if let Some(block) = blocks.get(vaddr) {
                     match execute_basic_block(cpu, bus, block) {
                         Ok(next_pc) => {
                             cpu.pc = next_pc;
@@ -127,6 +129,8 @@ fn execute_structure(
 }
 
 /// Execute a compiled region using structured control flow
+/// 
+/// All addresses are VIRTUAL. Uses cpu.pc directly for block lookups.
 pub fn execute_region(
     cpu: &mut Cpu,
     bus: &mut impl Bus,
@@ -138,14 +142,28 @@ pub fn execute_region(
         return RegionResult::Exit(cpu.pc);
     };
     
-    // Verify we're at a valid entry point
-    let pc = cpu.pc;
-    if !region.blocks.contains_key(&pc) {
-        return RegionResult::Exit(pc);
+    // Verify we're at a valid entry point (use virtual address directly)
+    let vaddr = cpu.pc;
+    if !region.blocks.contains_key(&vaddr) {
+        return RegionResult::Exit(vaddr);
     }
     
-    // Execute structured control flow
-    execute_structure(cpu, bus, &region.structure, &region.blocks, page)
+    // Execute starting from current block
+    if let Some(block) = region.blocks.get(&vaddr) {
+        match execute_basic_block(cpu, bus, block) {
+            Ok(next_pc) => {
+                cpu.pc = next_pc;
+                // If next PC is outside this region, exit
+                if !page.contains(next_pc) || !region.blocks.contains_key(&next_pc) {
+                    return RegionResult::Exit(next_pc);
+                }
+                // Continue with regular structure execution
+                return execute_structure(cpu, bus, &region.structure, &region.blocks, page);
+            }
+            Err(trap) => return RegionResult::Trap(trap),
+        }
+    }
+    RegionResult::Exit(cpu.pc)
 }
 
 /// Simple linear execution fallback (used when structure is empty)
@@ -159,7 +177,7 @@ pub fn execute_region_linear(
     let mut iterations = 0;
 
     loop {
-        // Find the block containing current PC
+        // Find the block containing current PC (VA)
         let block = match region.blocks.get(&pc) {
             Some(b) => b,
             None => return RegionResult::Exit(pc),

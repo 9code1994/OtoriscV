@@ -60,7 +60,7 @@ fn set_raw_terminal(enable: bool) {
 struct BenchmarkConfig {
     enabled: bool,
     exit_on_prompt: bool,
-    inline_switch_mode: bool,
+    jit_v2: bool,
 }
 
 struct BenchmarkResult {
@@ -97,12 +97,8 @@ fn run_emulator(system: &mut System, config: &BenchmarkConfig) -> io::Result<Ben
         }
         
         // Run a batch of cycles
-        let cycles_to_run = if config.inline_switch_mode { 1000000 } else { 10000 };
-        let cycles_run = if config.inline_switch_mode {
-            system.run_inline_switch(cycles_to_run)
-        } else {
-            system.run(cycles_to_run)
-        };
+        let cycles_to_run = 1000000;
+        let cycles_run = system.run(cycles_to_run);
         instructions += cycles_run as u64;
         
         // Handle UART Output
@@ -161,7 +157,7 @@ fn main() -> io::Result<()> {
     let mut config = BenchmarkConfig {
         enabled: false,
         exit_on_prompt: false,
-        inline_switch_mode: false,
+        jit_v2: false,
     };
 
     let mut i = 1;
@@ -194,8 +190,8 @@ fn main() -> io::Result<()> {
                 config.enabled = true;
                 config.exit_on_prompt = true;
             }
-            "--inline-switch" => {
-                config.inline_switch_mode = true;
+            "--jit-v2" => {
+                config.jit_v2 = true;
             }
             "--fs" => {
                 i += 1;
@@ -212,7 +208,7 @@ fn main() -> io::Result<()> {
     }
 
     if kernel_path.is_empty() {
-        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark] [--fast-mode] [--inline-switch]", args[0]);
+        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark] [--inline-switch] [--jit-v2]", args[0]);
         std::process::exit(1);
     }
     
@@ -228,6 +224,12 @@ fn main() -> io::Result<()> {
     
     let fs_option = if !fs_path.is_empty() { Some(fs_path.as_str()) } else { None };
     let mut system = System::new(ram_size_mb, fs_option).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    
+    // Enable JIT v2 if requested (experimental, has VA/PA bugs)
+    if config.jit_v2 {
+        eprintln!("WARNING: JIT v2 is experimental and has known bugs (VA/PA mismatch)");
+        system.enable_jit_v2(true);
+    }
     
     // Read kernel file
     let mut f = File::open(&kernel_path)?;

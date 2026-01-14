@@ -94,12 +94,6 @@ impl Emulator {
         self.system.run(cycles)
     }
     
-    /// Run with inline switch (jor1k-style direct interpretation)
-    /// Note: For best performance, use run() with JIT v2 enabled instead
-    pub fn run_inline_switch(&mut self, cycles: u32) -> u32 {
-        self.system.run_inline_switch(cycles)
-    }
-    
     /// Enable or disable JIT v2 (advanced page-based JIT with CFG optimization)
     pub fn enable_jit_v2(&mut self, enable: bool) {
         self.system.enable_jit_v2(enable);

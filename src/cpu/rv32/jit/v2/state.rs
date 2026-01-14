@@ -1,4 +1,10 @@
 //! JIT state management
+//!
+//! JIT v2 works with virtual addresses. All blocks and pages are keyed by VA.
+//! The cache must be invalidated on:
+//! - SFENCE.VMA instruction
+//! - Privilege level changes (mstatus.MPRV, etc.)
+//! - SATP register changes
 
 use std::collections::{HashMap, HashSet};
 use super::types::{Page, CompiledRegion};
@@ -22,15 +28,20 @@ pub struct PageStats {
 }
 
 /// JIT compilation state
+/// 
+/// All addresses are VIRTUAL addresses. The JIT cache is invalidated
+/// when page tables change (SFENCE.VMA, SATP write).
 pub struct JitState {
-    /// Per-page statistics
+    /// Per-page statistics (keyed by virtual page)
     page_stats: HashMap<Page, PageStats>,
-    /// Compiled regions
+    /// Compiled regions (keyed by virtual page)
     regions: HashMap<Page, CompiledRegion>,
     /// Global generation counter
     generation: u32,
     /// Compilation threshold
     threshold: u32,
+    /// Last SATP value (to detect page table changes)
+    last_satp: u32,
     /// Statistics
     pub compiles: u64,
     pub region_hits: u64,
@@ -50,6 +61,7 @@ impl JitState {
             regions: HashMap::new(),
             generation: 1,
             threshold: JIT_THRESHOLD,
+            last_satp: 0,
             compiles: 0,
             region_hits: 0,
             region_misses: 0,
@@ -61,11 +73,20 @@ impl JitState {
         self.threshold = threshold;
     }
 
-    /// Record execution and return page if compilation should be triggered
+    /// Check if SATP changed and invalidate if needed
     #[inline]
-    pub fn record_execution(&mut self, paddr: u32, heat: u32) -> Option<Page> {
-        let page = Page::of(paddr);
-        let offset = (paddr & 0xFFF) as u16;
+    pub fn check_satp(&mut self, satp: u32) {
+        if satp != self.last_satp {
+            self.invalidate_all();
+            self.last_satp = satp;
+        }
+    }
+
+    /// Record execution at a virtual address and return page if compilation should be triggered
+    #[inline]
+    pub fn record_execution(&mut self, vaddr: u32, heat: u32) -> Option<Page> {
+        let page = Page::of(vaddr);
+        let offset = (vaddr & 0xFFF) as u16;
 
         let stats = self.page_stats.entry(page).or_default();
         stats.entry_points.insert(offset);
@@ -79,7 +100,7 @@ impl JitState {
         }
     }
 
-    /// Get compiled region for a page
+    /// Get compiled region for a virtual page
     #[inline]
     pub fn get_region(&mut self, page: Page) -> Option<&CompiledRegion> {
         if let Some(region) = self.regions.get(&page) {
@@ -92,7 +113,10 @@ impl JitState {
         None
     }
 
-    /// Compile a region for the given page
+    /// Compile a region for the given virtual page
+    /// 
+    /// The bus is used to read instructions. Since we're using virtual addresses,
+    /// the bus must handle VA→PA translation (which SystemBus does via MMU).
     pub fn compile_region(&mut self, bus: &mut impl Bus, page: Page) {
         let entry_points: Vec<u32> = self
             .page_stats
@@ -106,7 +130,7 @@ impl JitState {
             })
             .unwrap_or_else(|| vec![page.base_addr()]);
 
-        // Discover basic blocks
+        // Discover basic blocks (using virtual addresses)
         let blocks = discover_basic_blocks(bus, page, &entry_points);
 
         if blocks.is_empty() {
@@ -135,7 +159,7 @@ impl JitState {
         self.compiles += 1;
     }
 
-    /// Invalidate all compiled regions
+    /// Invalidate all compiled regions (called on SFENCE.VMA, SATP change)
     pub fn invalidate_all(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
@@ -143,7 +167,7 @@ impl JitState {
         }
     }
 
-    /// Invalidate a specific page
+    /// Invalidate a specific virtual page
     pub fn invalidate_page(&mut self, page: Page) {
         self.regions.remove(&page);
         self.page_stats.remove(&page);
@@ -154,6 +178,7 @@ impl JitState {
         self.page_stats.clear();
         self.regions.clear();
         self.generation = 1;
+        self.last_satp = 0;
         self.compiles = 0;
         self.region_hits = 0;
         self.region_misses = 0;

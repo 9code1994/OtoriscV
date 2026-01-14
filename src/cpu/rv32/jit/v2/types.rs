@@ -7,14 +7,17 @@ use crate::cpu::trap::Trap;
 // Core Types
 // =============================================================================
 
-/// Physical page identifier (upper 20 bits of address)
+/// Virtual page identifier (upper 20 bits of virtual address)
+/// 
+/// JIT v2 works with virtual addresses. Blocks are keyed by VA, and
+/// the cache is invalidated on SFENCE.VMA or privilege level changes.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Page(u32);
 
 impl Page {
     #[inline(always)]
-    pub fn of(addr: u32) -> Self {
-        Page(addr >> 12)
+    pub fn of(vaddr: u32) -> Self {
+        Page(vaddr >> 12)
     }
 
     #[inline(always)]
@@ -23,8 +26,8 @@ impl Page {
     }
 
     #[inline(always)]
-    pub fn contains(self, addr: u32) -> bool {
-        Page::of(addr) == self
+    pub fn contains(self, vaddr: u32) -> bool {
+        Page::of(vaddr) == self
     }
 }
 
