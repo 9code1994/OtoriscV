@@ -136,6 +136,87 @@ impl Memory {
         self.ram.len()
     }
     
+    /// Get direct access to RAM slice (for jor1k-style direct access optimization)
+    /// 
+    /// # Safety
+    /// Callers must ensure:
+    /// - Addresses are properly bounds-checked before access
+    /// - No aliasing violations when combined with other mutable access
+    #[inline(always)]
+    pub fn ram_slice(&self) -> &[u8] {
+        &self.ram
+    }
+    
+    /// Get mutable direct access to RAM slice
+    #[inline(always)]
+    pub fn ram_slice_mut(&mut self) -> &mut [u8] {
+        &mut self.ram
+    }
+    
+    /// Direct 32-bit RAM read (no bounds check - caller must ensure validity)
+    /// 
+    /// jor1k-style optimization: single array access, no function call overhead
+    #[inline(always)]
+    pub unsafe fn ram_read32_unchecked(&self, offset: usize) -> u32 {
+        debug_assert!(offset + 3 < self.ram.len());
+        let ptr = self.ram.as_ptr().add(offset) as *const u32;
+        ptr.read_unaligned()
+    }
+    
+    /// Direct 32-bit RAM write (no bounds check - caller must ensure validity)
+    #[inline(always)]
+    pub unsafe fn ram_write32_unchecked(&mut self, offset: usize, value: u32) {
+        debug_assert!(offset + 3 < self.ram.len());
+        let ptr = self.ram.as_mut_ptr().add(offset) as *mut u32;
+        ptr.write_unaligned(value);
+    }
+    
+    /// Direct 8-bit RAM read (no bounds check)
+    #[inline(always)]
+    pub unsafe fn ram_read8_unchecked(&self, offset: usize) -> u8 {
+        debug_assert!(offset < self.ram.len());
+        *self.ram.get_unchecked(offset)
+    }
+    
+    /// Direct 8-bit RAM write (no bounds check)
+    #[inline(always)]
+    pub unsafe fn ram_write8_unchecked(&mut self, offset: usize, value: u8) {
+        debug_assert!(offset < self.ram.len());
+        *self.ram.get_unchecked_mut(offset) = value;
+    }
+    
+    /// Direct 16-bit RAM read (no bounds check)
+    #[inline(always)]
+    pub unsafe fn ram_read16_unchecked(&self, offset: usize) -> u16 {
+        debug_assert!(offset + 1 < self.ram.len());
+        let ptr = self.ram.as_ptr().add(offset) as *const u16;
+        ptr.read_unaligned()
+    }
+    
+    /// Direct 16-bit RAM write (no bounds check)
+    #[inline(always)]
+    pub unsafe fn ram_write16_unchecked(&mut self, offset: usize, value: u16) {
+        debug_assert!(offset + 1 < self.ram.len());
+        let ptr = self.ram.as_mut_ptr().add(offset) as *mut u16;
+        ptr.write_unaligned(value);
+    }
+    
+    /// Direct 64-bit RAM read (no bounds check)
+    #[inline(always)]
+    pub unsafe fn ram_read64_unchecked(&self, offset: usize) -> u64 {
+        debug_assert!(offset + 7 < self.ram.len());
+        let ptr = self.ram.as_ptr().add(offset) as *const u64;
+        ptr.read_unaligned()
+    }
+    
+    /// Direct 64-bit RAM write (no bounds check)
+    #[inline(always)]
+    pub unsafe fn ram_write64_unchecked(&mut self, offset: usize, value: u64) {
+        debug_assert!(offset + 7 < self.ram.len());
+        let ptr = self.ram.as_mut_ptr().add(offset) as *mut u64;
+        ptr.write_unaligned(value);
+    }
+    
     /// Add a device at the specified address range
     pub fn add_device(&mut self, device: Box<dyn Device>, base: u32, size: u32) {
         let device_idx = self.devices.len();

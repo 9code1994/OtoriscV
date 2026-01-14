@@ -252,13 +252,13 @@ impl System {
         let priv_level = self.cpu.priv_level;
         
         // Create bus for translation
-        let mut bus = SystemBus {
-            memory: &mut self.memory,
-            uart: &mut self.uart,
-            clint: &mut self.clint,
-            plic: &mut self.plic,
-            virtio9p: &mut self.virtio9p,
-        };
+        let mut bus = SystemBus::new(
+            &mut self.memory,
+            &mut self.uart,
+            &mut self.clint,
+            &mut self.plic,
+            &mut self.virtio9p,
+        );
         
         let paddr = match self.cpu.mmu.translate(
             self.cpu.pc, 
@@ -334,13 +334,13 @@ impl System {
     /// Execute one instruction, handling device I/O specially
     fn step_with_devices(&mut self) -> Result<(), crate::cpu::trap::Trap> {
         // Create a temporary bus that has access to everything
-        let mut bus = SystemBus {
-            memory: &mut self.memory,
-            uart: &mut self.uart,
-            clint: &mut self.clint,
-            plic: &mut self.plic,
-            virtio9p: &mut self.virtio9p,
-        };
+        let mut bus = SystemBus::new(
+            &mut self.memory,
+            &mut self.uart,
+            &mut self.clint,
+            &mut self.plic,
+            &mut self.virtio9p,
+        );
         
         let result = self.cpu.step(&mut bus);
         
@@ -596,21 +596,65 @@ impl System {
 }
 
 /// Bus implementation that routes to devices
+/// 
+/// Uses jor1k-style direct RAM access optimization:
+/// - RAM accesses (>= 0x80000000) use direct pointer/slice access
+/// - MMIO accesses use function call dispatch (cold path)
 struct SystemBus<'a> {
     memory: &'a mut Memory,
     uart: &'a mut Uart,
     clint: &'a mut Clint,
     plic: &'a mut Plic,
     virtio9p: &'a mut Virtio9p,
+    /// Cached RAM size for bounds checking
+    ram_size: usize,
 }
 
 use crate::memory::Bus;
 
+impl<'a> SystemBus<'a> {
+    /// Create a new SystemBus with cached RAM size
+    #[inline]
+    fn new(
+        memory: &'a mut Memory,
+        uart: &'a mut Uart,
+        clint: &'a mut Clint,
+        plic: &'a mut Plic,
+        virtio9p: &'a mut Virtio9p,
+    ) -> Self {
+        let ram_size = memory.ram_size();
+        SystemBus {
+            memory,
+            uart,
+            clint,
+            plic,
+            virtio9p,
+            ram_size,
+        }
+    }
+    
+    /// Check if address is in RAM range and return offset
+    /// jor1k-style: uses signed comparison trick
+    #[inline(always)]
+    fn ram_offset(&self, addr: u32) -> Option<usize> {
+        // jor1k trick: addr >= 0x80000000 means (addr as i32) < 0
+        // But we also need bounds check for RAM size
+        if addr >= DRAM_BASE {
+            let offset = (addr - DRAM_BASE) as usize;
+            if offset < self.ram_size {
+                return Some(offset);
+            }
+        }
+        None
+    }
+}
+
 impl<'a> Bus for SystemBus<'a> {
     fn read8(&mut self, addr: u32) -> u8 {
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            return self.memory.read8(addr);
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // SAFETY: ram_offset ensures offset is within bounds
+            return unsafe { self.memory.ram_read8_unchecked(offset) };
         }
         // Device checks (less common)
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
@@ -630,9 +674,10 @@ impl<'a> Bus for SystemBus<'a> {
     }
     
     fn write8(&mut self, addr: u32, value: u8) {
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            self.memory.write8(addr, value);
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // SAFETY: ram_offset ensures offset is within bounds
+            unsafe { self.memory.ram_write8_unchecked(offset, value) };
             return;
         }
         // Device checks
@@ -657,22 +702,29 @@ impl<'a> Bus for SystemBus<'a> {
     }
     
     fn read16(&mut self, addr: u32) -> u16 {
-        // For devices, we can fall back to read8 logic (or implement specific if needed)
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            return self.memory.read16(addr);
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // Check we have room for 16-bit read
+            if offset + 1 < self.ram_size {
+                // SAFETY: bounds checked above
+                return unsafe { self.memory.ram_read16_unchecked(offset) };
+            }
         }
-        // Compose from byte reads for devices
+        // Device checks - compose from byte reads
         let lo = self.read8(addr) as u16;
         let hi = self.read8(addr + 1) as u16;
         lo | (hi << 8)
     }
     
     fn write16(&mut self, addr: u32, value: u16) {
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            self.memory.write16(addr, value);
-            return;
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // Check we have room for 16-bit write
+            if offset + 1 < self.ram_size {
+                // SAFETY: bounds checked above
+                unsafe { self.memory.ram_write16_unchecked(offset, value) };
+                return;
+            }
         }
         // Compose to byte writes for devices
         self.write8(addr, value as u8);
@@ -680,9 +732,13 @@ impl<'a> Bus for SystemBus<'a> {
     }
     
     fn read32(&mut self, addr: u32) -> u32 {
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            return self.memory.read32(addr);
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // Check we have room for 32-bit read
+            if offset + 3 < self.ram_size {
+                // SAFETY: bounds checked above
+                return unsafe { self.memory.ram_read32_unchecked(offset) };
+            }
         }
         // Device checks
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
@@ -702,10 +758,14 @@ impl<'a> Bus for SystemBus<'a> {
     }
     
     fn write32(&mut self, addr: u32, value: u32) {
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            self.memory.write32(addr, value);
-            return;
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // Check we have room for 32-bit write
+            if offset + 3 < self.ram_size {
+                // SAFETY: bounds checked above
+                unsafe { self.memory.ram_write32_unchecked(offset, value) };
+                return;
+            }
         }
         // Device checks
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
@@ -729,9 +789,13 @@ impl<'a> Bus for SystemBus<'a> {
     }
     
     fn read64(&mut self, addr: u32) -> u64 {
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            return self.memory.read64(addr);
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // Check we have room for 64-bit read
+            if offset + 7 < self.ram_size {
+                // SAFETY: bounds checked above
+                return unsafe { self.memory.ram_read64_unchecked(offset) };
+            }
         }
         // CLINT has 64-bit registers (mtime, mtimecmp)
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
@@ -746,10 +810,14 @@ impl<'a> Bus for SystemBus<'a> {
     }
     
     fn write64(&mut self, addr: u32, value: u64) {
-        // Fast path: RAM (most common)
-        if addr >= DRAM_BASE {
-            self.memory.write64(addr, value);
-            return;
+        // jor1k-style: fast path for RAM using direct access
+        if let Some(offset) = self.ram_offset(addr) {
+            // Check we have room for 64-bit write
+            if offset + 7 < self.ram_size {
+                // SAFETY: bounds checked above
+                unsafe { self.memory.ram_write64_unchecked(offset, value) };
+                return;
+            }
         }
         // CLINT has 64-bit registers (mtime, mtimecmp)
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
