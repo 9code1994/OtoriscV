@@ -173,23 +173,28 @@ impl System {
     pub fn run(&mut self, max_cycles: u32) -> u32 {
         let mut cycles = 0u32;
         
+        // Batch size for timer updates (jor1k uses 64)
+        const TIMER_BATCH: u32 = 64;
+        
         while cycles < max_cycles {
-            // Update timer
-            self.clint.tick(1);
-            self.cpu.csr.time = self.clint.get_mtime();
+            // Batched timer update - only every TIMER_BATCH cycles
+            if cycles & (TIMER_BATCH - 1) == 0 {
+                self.clint.tick(TIMER_BATCH as u64);
+                self.cpu.csr.time = self.clint.get_mtime();
+                
+                // Check for interrupts (also batched)
+                self.update_interrupts();
+                
+                // Handle pending interrupts
+                if let Some(trap) = self.cpu.check_interrupts() {
+                    self.cpu.handle_trap(trap);
+                }
+            }
             
             // Check for cache invalidation request from CPU (FENCE.I, SFENCE.VMA)
             if self.cpu.cache_invalidation_pending {
                 self.block_cache.invalidate_all();
                 self.cpu.cache_invalidation_pending = false;
-            }
-            
-            // Check for interrupts
-            self.update_interrupts();
-            
-            // Handle pending interrupts
-            if let Some(trap) = self.cpu.check_interrupts() {
-                self.cpu.handle_trap(trap);
             }
             
             // If waiting for interrupt, check if any interrupt is pending

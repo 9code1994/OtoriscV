@@ -2,7 +2,7 @@
 //!
 //! Handles virtual address translation for 32-bit RISC-V.
 //! Supports 4KB pages and 4MB megapages.
-//! Uses ultra-simple single-entry TLBs per access type (like jor1k).
+//! Uses jor1k-style XOR TLB for ultra-fast translation.
 
 use crate::cpu::PrivilegeLevel;
 use crate::memory::Bus;
@@ -10,50 +10,44 @@ use crate::memory::Bus;
 /// Access type for translation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessType {
-    Instruction,
-    Load,
-    Store,
+    Instruction = 0,
+    Load = 1,
+    Store = 2,
 }
 
-/// Ultra-simple single-entry TLB per access type
-/// Stores the VPN and pre-computed physical page base
+/// jor1k-style XOR TLB entry
+/// 
+/// The key insight: store (paddr XOR vaddr) masked to page boundary.
+/// On hit, a single XOR gives the physical address.
 #[derive(Clone, Copy)]
-struct SimpleTlbEntry {
-    /// Virtual page number (vaddr >> page_shift)
-    vpn: u32,
-    /// Physical address base (ppn << page_shift), XORed to allow direct use
-    pa_base: u32,
-    /// Page mask (0xFFF for 4KB, 0x3FFFFF for 4MB)
-    offset_mask: u32,
-    /// Valid flag
-    valid: bool,
+struct XorTlbEntry {
+    /// vaddr check value (vaddr & page_mask)
+    check: u32,
+    /// XOR lookup: ((paddr ^ vaddr) & page_mask)
+    /// To get paddr: lookup ^ vaddr
+    lookup: u32,
+    /// Page mask (inverted offset mask): 0xFFFFF000 for 4KB, 0xFFC00000 for 4MB
+    page_mask: u32,
 }
 
-impl SimpleTlbEntry {
+impl XorTlbEntry {
     const fn empty() -> Self {
-        SimpleTlbEntry {
-            vpn: 0,
-            pa_base: 0,
-            offset_mask: 0,
-            valid: false,
+        XorTlbEntry {
+            check: 0xFFFF_FFFF,  // Invalid - won't match any vaddr
+            lookup: 0,
+            page_mask: 0xFFFF_F000,
         }
     }
 }
 
-/// MMU State with ultra-fast TLB
+/// MMU State with jor1k-style XOR TLB
 pub struct Mmu {
-    /// Single TLB entry for instruction fetch
-    itlb: SimpleTlbEntry,
-    /// Single TLB entry for loads  
-    dtlb_read: SimpleTlbEntry,
-    /// Single TLB entry for stores
-    dtlb_write: SimpleTlbEntry,
+    /// XOR TLB entries: [Instruction, Load, Store]
+    tlb: [XorTlbEntry; 3],
     
     /// Generation for lazy invalidation
     generation: u32,
-    itlb_gen: u32,
-    dtlb_read_gen: u32,
-    dtlb_write_gen: u32,
+    tlb_gen: [u32; 3],
     
     /// Stats
     tlb_hits: u64,
@@ -69,13 +63,9 @@ impl Default for Mmu {
 impl Mmu {
     pub fn new() -> Self {
         Mmu {
-            itlb: SimpleTlbEntry::empty(),
-            dtlb_read: SimpleTlbEntry::empty(),
-            dtlb_write: SimpleTlbEntry::empty(),
+            tlb: [XorTlbEntry::empty(); 3],
             generation: 1,
-            itlb_gen: 0,
-            dtlb_read_gen: 0,
-            dtlb_write_gen: 0,
+            tlb_gen: [0; 3],
             tlb_hits: 0,
             tlb_misses: 0,
         }
@@ -94,7 +84,7 @@ impl Mmu {
         (self.tlb_hits, self.tlb_misses)
     }
 
-    /// Ultra-fast translation with inline TLB check
+    /// Ultra-fast translation with jor1k-style XOR TLB
     #[inline(always)]
     pub fn translate(&mut self, vaddr: u32, access_type: AccessType, priv_level: PrivilegeLevel, bus: &mut impl Bus, satp: u32, mstatus: u32) -> Result<u32, u32> {
         // Fast path: Machine mode or paging disabled
@@ -103,35 +93,16 @@ impl Mmu {
             return Ok(vaddr);
         }
 
-        // TLB lookup based on access type
-        match access_type {
-            AccessType::Instruction => {
-                if self.itlb_gen == self.generation && self.itlb.valid {
-                    let vpn = vaddr & !self.itlb.offset_mask;
-                    if vpn == self.itlb.vpn {
-                        self.tlb_hits += 1;
-                        return Ok(self.itlb.pa_base | (vaddr & self.itlb.offset_mask));
-                    }
-                }
-            }
-            AccessType::Load => {
-                if self.dtlb_read_gen == self.generation && self.dtlb_read.valid {
-                    let vpn = vaddr & !self.dtlb_read.offset_mask;
-                    if vpn == self.dtlb_read.vpn {
-                        self.tlb_hits += 1;
-                        return Ok(self.dtlb_read.pa_base | (vaddr & self.dtlb_read.offset_mask));
-                    }
-                }
-            }
-            AccessType::Store => {
-                if self.dtlb_write_gen == self.generation && self.dtlb_write.valid {
-                    let vpn = vaddr & !self.dtlb_write.offset_mask;
-                    if vpn == self.dtlb_write.vpn {
-                        self.tlb_hits += 1;
-                        return Ok(self.dtlb_write.pa_base | (vaddr & self.dtlb_write.offset_mask));
-                    }
-                }
-            }
+        // XOR TLB lookup - single comparison, single XOR on hit
+        let idx = access_type as usize;
+        let entry = &self.tlb[idx];
+        
+        // Check: (entry.check XOR vaddr) masked should be 0 for hit
+        if self.tlb_gen[idx] == self.generation && 
+           (entry.check ^ vaddr) & entry.page_mask == 0 {
+            // HIT: single XOR gives physical address
+            self.tlb_hits += 1;
+            return Ok(entry.lookup ^ vaddr);
         }
 
         // TLB miss - do full page walk
@@ -174,14 +145,9 @@ impl Mmu {
             
             self.update_ad_bits(bus, pte1_addr, pte1, access_type)?;
             
-            // Fill TLB with megapage entry
-            let entry = SimpleTlbEntry {
-                vpn: vaddr & 0xFFC0_0000, // 4MB aligned
-                pa_base,
-                offset_mask: 0x003F_FFFF, // 4MB - 1
-                valid: true,
-            };
-            self.fill_tlb(access_type, entry);
+            // Fill XOR TLB with megapage entry (4MB)
+            let page_mask = 0xFFC0_0000u32;  // 4MB page mask
+            self.fill_xor_tlb(access_type, vaddr, paddr, page_mask);
             
             return Ok(paddr);
         }
@@ -209,34 +175,26 @@ impl Mmu {
         
         self.update_ad_bits(bus, pte0_addr, pte0, access_type)?;
 
-        // Fill TLB with 4KB entry
-        let entry = SimpleTlbEntry {
-            vpn: vaddr & 0xFFFF_F000, // 4KB aligned
-            pa_base,
-            offset_mask: 0x0000_0FFF, // 4KB - 1
-            valid: true,
-        };
-        self.fill_tlb(access_type, entry);
+        // Fill XOR TLB with 4KB entry
+        let page_mask = 0xFFFF_F000u32;  // 4KB page mask
+        self.fill_xor_tlb(access_type, vaddr, paddr, page_mask);
 
         Ok(paddr)
     }
 
+    /// Fill XOR TLB entry (jor1k style)
+    /// 
+    /// Stores: check = vaddr, lookup = paddr ^ vaddr (masked)
+    /// On hit: paddr = lookup ^ vaddr
     #[inline(always)]
-    fn fill_tlb(&mut self, access_type: AccessType, entry: SimpleTlbEntry) {
-        match access_type {
-            AccessType::Instruction => {
-                self.itlb = entry;
-                self.itlb_gen = self.generation;
-            }
-            AccessType::Load => {
-                self.dtlb_read = entry;
-                self.dtlb_read_gen = self.generation;
-            }
-            AccessType::Store => {
-                self.dtlb_write = entry;
-                self.dtlb_write_gen = self.generation;
-            }
-        }
+    fn fill_xor_tlb(&mut self, access_type: AccessType, vaddr: u32, paddr: u32, page_mask: u32) {
+        let idx = access_type as usize;
+        self.tlb[idx] = XorTlbEntry {
+            check: vaddr,
+            lookup: (paddr ^ vaddr) & page_mask,
+            page_mask,
+        };
+        self.tlb_gen[idx] = self.generation;
     }
     
     fn check_permissions(&self, pte: u32, access_type: AccessType, priv_level: PrivilegeLevel, mstatus: u32) -> Result<(), u32> {
