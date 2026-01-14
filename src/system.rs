@@ -502,130 +502,149 @@ use crate::memory::Bus;
 
 impl<'a> Bus for SystemBus<'a> {
     fn read8(&mut self, addr: u32) -> u8 {
-        // Check CLINT
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            return self.memory.read8(addr);
+        }
+        // Device checks (less common)
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             return self.clint.read8(addr - CLINT_BASE);
         }
-        // Check UART
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
             return self.uart.read8(addr - UART_BASE);
         }
-        // Check PLIC
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             return self.plic.read8(addr - PLIC_BASE);
         }
-        // Check VirtIO
         if addr >= VIRTIO_BASE && addr < VIRTIO_BASE + VIRTIO_SIZE {
             return self.virtio9p.read8(addr - VIRTIO_BASE);
         }
-        // Default to memory
+        // Fallback to memory for other addresses (ROM, etc)
         self.memory.read8(addr)
     }
     
     fn write8(&mut self, addr: u32, value: u8) {
-        // Check CLINT
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            self.memory.write8(addr, value);
+            return;
+        }
+        // Device checks
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             self.clint.write8(addr - CLINT_BASE, value);
             return;
         }
-        // Check UART
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
             self.uart.write8(addr - UART_BASE, value);
             return;
         }
-        // Check PLIC
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             self.plic.write8(addr - PLIC_BASE, value);
             return;
         }
-        // Check VirtIO
         if addr >= VIRTIO_BASE && addr < VIRTIO_BASE + VIRTIO_SIZE {
             self.virtio9p.write8(addr - VIRTIO_BASE, value);
             return;
         }
-        // Default to memory
+        // Fallback
         self.memory.write8(addr, value);
     }
     
     fn read16(&mut self, addr: u32) -> u16 {
         // For devices, we can fall back to read8 logic (or implement specific if needed)
-        // Since our devices don't explicitly implement read16, we'll compose it
-        // BUT wait, Clint and Plic MIGHT support wide reads.
-        // For now, let's just use byte reads for devices unless we're sure.
-        // ACTUALLY, memory.read16 handles unaligned access well.
-        // Let's implement 16-bit access by delegating to read8 for simple devices
-        // and check memory first for RAM speed.
-        
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            return self.memory.read16(addr);
+        }
+        // Compose from byte reads for devices
         let lo = self.read8(addr) as u16;
         let hi = self.read8(addr + 1) as u16;
         lo | (hi << 8)
     }
     
     fn write16(&mut self, addr: u32, value: u16) {
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            self.memory.write16(addr, value);
+            return;
+        }
+        // Compose to byte writes for devices
         self.write8(addr, value as u8);
         self.write8(addr + 1, (value >> 8) as u8);
     }
     
     fn read32(&mut self, addr: u32) -> u32 {
-        // Check CLINT
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            return self.memory.read32(addr);
+        }
+        // Device checks
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             return self.clint.read32(addr - CLINT_BASE);
         }
-        // Check UART
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
             return self.uart.read32(addr - UART_BASE);
         }
-        // Check PLIC
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             return self.plic.read32(addr - PLIC_BASE);
         }
-        // Check VirtIO
         if addr >= VIRTIO_BASE && addr < VIRTIO_BASE + VIRTIO_SIZE {
             return self.virtio9p.read32(addr - VIRTIO_BASE);
         }
-        // Default to memory
+        // Fallback
         self.memory.read32(addr)
     }
     
     fn write32(&mut self, addr: u32, value: u32) {
-        // Check CLINT
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            self.memory.write32(addr, value);
+            return;
+        }
+        // Device checks
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             self.clint.write32(addr - CLINT_BASE, value);
             return;
         }
-        // Check UART
         if addr >= UART_BASE && addr < UART_BASE + UART_SIZE {
             self.uart.write32(addr - UART_BASE, value);
             return;
         }
-        // Check PLIC
         if addr >= PLIC_BASE && addr < PLIC_BASE + PLIC_SIZE {
             self.plic.write32(addr - PLIC_BASE, value);
             return;
         }
-        // Check VirtIO
         if addr >= VIRTIO_BASE && addr < VIRTIO_BASE + VIRTIO_SIZE {
             self.virtio9p.write32(addr - VIRTIO_BASE, value);
             return;
         }
-        // Default to memory
+        // Fallback
         self.memory.write32(addr, value);
     }
     
     fn read64(&mut self, addr: u32) -> u64 {
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            return self.memory.read64(addr);
+        }
         // CLINT has 64-bit registers (mtime, mtimecmp)
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             let lo = self.clint.read32(addr - CLINT_BASE) as u64;
             let hi = self.clint.read32(addr - CLINT_BASE + 4) as u64;
             return lo | (hi << 32);
         }
-        // Default: compose from two 32-bit reads (for RAM and other devices)
+        // Default: compose from two 32-bit reads
         let lo = self.read32(addr) as u64;
         let hi = self.read32(addr + 4) as u64;
         lo | (hi << 32)
     }
     
     fn write64(&mut self, addr: u32, value: u64) {
+        // Fast path: RAM (most common)
+        if addr >= DRAM_BASE {
+            self.memory.write64(addr, value);
+            return;
+        }
         // CLINT has 64-bit registers (mtime, mtimecmp)
         if addr >= CLINT_BASE && addr < CLINT_BASE + CLINT_SIZE {
             self.clint.write32(addr - CLINT_BASE, value as u32);
