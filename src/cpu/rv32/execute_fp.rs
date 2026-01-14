@@ -19,7 +19,8 @@ impl Cpu {
             return Err(Trap::IllegalInstruction(inst));
         }
         
-        let vaddr = self.read_reg(d.rs1).wrapping_add(d.imm_i as u32);
+        let imm = DecodedInst::imm_i(inst) as u32;
+        let vaddr = self.read_reg(d.rs1).wrapping_add(imm);
         let satp = self.csr.satp;
         let mstatus = self.csr.mstatus;
         let mut priv_level = self.priv_level;
@@ -72,7 +73,8 @@ impl Cpu {
             return Err(Trap::IllegalInstruction(inst));
         }
         
-        let vaddr = self.read_reg(d.rs1).wrapping_add(d.imm_s as u32);
+        let imm = DecodedInst::imm_s(inst) as u32;
+        let vaddr = self.read_reg(d.rs1).wrapping_add(imm);
         let satp = self.csr.satp;
         let mstatus = self.csr.mstatus;
         let mut priv_level = self.priv_level;

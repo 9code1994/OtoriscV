@@ -29,28 +29,12 @@ impl DecodedInst {
         let rs3 = (inst >> 27) & 0x1F;  // For R4-type (fused multiply-add)
         let funct3 = (inst >> 12) & 0x7;
         let funct7 = (inst >> 25) & 0x7F;
-        
-        // I-type immediate
-        let imm_i = (inst as i32) >> 20;
-        
-        // S-type immediate
-        let imm_s = ((inst & 0xFE000000) as i32 >> 20) | ((inst >> 7) & 0x1F) as i32;
-        
-        // B-type immediate
-        let imm_b = ((inst & 0x80000000) as i32 >> 19) |
-                    (((inst >> 7) & 1) << 11) as i32 |
-                    (((inst >> 25) & 0x3F) << 5) as i32 |
-                    (((inst >> 8) & 0xF) << 1) as i32;
-        
-        // U-type immediate
-        let imm_u = (inst & 0xFFFFF000) as i32;
-        
-        // J-type immediate
-        let imm_j = ((inst & 0x80000000) as i32 >> 11) |
-                    (inst & 0xFF000) as i32 |
-                    (((inst >> 20) & 1) << 11) as i32 |
-                    (((inst >> 21) & 0x3FF) << 1) as i32;
-        
+        let imm_i = 0;
+        let imm_s = 0;
+        let imm_b = 0;
+        let imm_u = 0;
+        let imm_j = 0;
+
         DecodedInst {
             opcode,
             rd,
@@ -65,6 +49,37 @@ impl DecodedInst {
             imm_u,
             imm_j,
         }
+    }
+
+    #[inline(always)]
+    pub fn imm_i(inst: u32) -> i32 {
+        (inst as i32) >> 20
+    }
+
+    #[inline(always)]
+    pub fn imm_s(inst: u32) -> i32 {
+        ((inst & 0xFE000000) as i32 >> 20) | ((inst >> 7) & 0x1F) as i32
+    }
+
+    #[inline(always)]
+    pub fn imm_b(inst: u32) -> i32 {
+        ((inst & 0x80000000) as i32 >> 19) |
+            (((inst >> 7) & 1) << 11) as i32 |
+            (((inst >> 25) & 0x3F) << 5) as i32 |
+            (((inst >> 8) & 0xF) << 1) as i32
+    }
+
+    #[inline(always)]
+    pub fn imm_u(inst: u32) -> i32 {
+        (inst & 0xFFFFF000) as i32
+    }
+
+    #[inline(always)]
+    pub fn imm_j(inst: u32) -> i32 {
+        ((inst & 0x80000000) as i32 >> 11) |
+            (inst & 0xFF000) as i32 |
+            (((inst >> 20) & 1) << 11) as i32 |
+            (((inst >> 21) & 0x3FF) << 1) as i32
     }
 }
 

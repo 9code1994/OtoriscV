@@ -17,22 +17,26 @@ impl Cpu {
         
         match d.opcode {
             OP_LUI => {
-                self.write_reg(d.rd, d.imm_u as u32);
+                let imm = DecodedInst::imm_u(inst) as u32;
+                self.write_reg(d.rd, imm);
                 self.pc = self.pc.wrapping_add(4);
             }
             
             OP_AUIPC => {
-                self.write_reg(d.rd, self.pc.wrapping_add(d.imm_u as u32));
+                let imm = DecodedInst::imm_u(inst) as u32;
+                self.write_reg(d.rd, self.pc.wrapping_add(imm));
                 self.pc = self.pc.wrapping_add(4);
             }
             
             OP_JAL => {
+                let imm = DecodedInst::imm_j(inst) as u32;
                 self.write_reg(d.rd, self.pc.wrapping_add(4));
-                self.pc = self.pc.wrapping_add(d.imm_j as u32);
+                self.pc = self.pc.wrapping_add(imm);
             }
             
             OP_JALR => {
-                let target = (self.read_reg(d.rs1).wrapping_add(d.imm_i as u32)) & !1;
+                let imm = DecodedInst::imm_i(inst) as u32;
+                let target = (self.read_reg(d.rs1).wrapping_add(imm)) & !1;
                 self.write_reg(d.rd, self.pc.wrapping_add(4));
                 self.pc = target;
             }
@@ -40,6 +44,7 @@ impl Cpu {
             OP_BRANCH => {
                 let rs1 = self.read_reg(d.rs1);
                 let rs2 = self.read_reg(d.rs2);
+                let imm = DecodedInst::imm_b(inst) as u32;
                 
                 let taken = match d.funct3 {
                     FUNCT3_BEQ => rs1 == rs2,
@@ -52,14 +57,15 @@ impl Cpu {
                 };
                 
                 if taken {
-                    self.pc = self.pc.wrapping_add(d.imm_b as u32);
+                    self.pc = self.pc.wrapping_add(imm);
                 } else {
                     self.pc = self.pc.wrapping_add(4);
                 }
             }
             
             OP_LOAD => {
-                let vaddr = self.read_reg(d.rs1).wrapping_add(d.imm_i as u32);
+                let imm = DecodedInst::imm_i(inst) as u32;
+                let vaddr = self.read_reg(d.rs1).wrapping_add(imm);
                 let satp = self.csr.satp;
                 let mstatus = self.csr.mstatus;
                 let mut priv_level = self.priv_level;
@@ -122,7 +128,8 @@ impl Cpu {
             }
             
             OP_STORE => {
-                let vaddr = self.read_reg(d.rs1).wrapping_add(d.imm_s as u32);
+                let imm = DecodedInst::imm_s(inst) as u32;
+                let vaddr = self.read_reg(d.rs1).wrapping_add(imm);
                 let value = self.read_reg(d.rs2);
                 let satp = self.csr.satp;
                 let mstatus = self.csr.mstatus;
@@ -181,7 +188,7 @@ impl Cpu {
             
             OP_OP_IMM => {
                 let rs1 = self.read_reg(d.rs1);
-                let imm = d.imm_i as u32;
+                let imm = DecodedInst::imm_i(inst) as u32;
                 let shamt = (imm & 0x1F) as u32;
                 
                 let result = match d.funct3 {
