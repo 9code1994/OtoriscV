@@ -5,6 +5,106 @@ use std::io::{self, Read, Write, stdout};
 // Use the library crate's modules
 use otoriscv::System;
 
+// Set stdin to non-blocking mode
+fn set_nonblocking(fd: i32, nonblocking: bool) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if nonblocking {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        } else {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+}
+
+// Set terminal to raw mode (no echo, no line buffering)
+fn set_raw_terminal(enable: bool) {
+    use std::mem::MaybeUninit;
+    
+    static mut ORIG_TERMIOS: MaybeUninit<libc::termios> = MaybeUninit::uninit();
+    static mut SAVED: bool = false;
+    
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        
+        if enable {
+            // Save original settings
+            if !SAVED {
+                libc::tcgetattr(fd, ORIG_TERMIOS.as_mut_ptr());
+                SAVED = true;
+            }
+            
+            // Get current settings and modify
+            let mut raw: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(fd, &mut raw);
+            
+            // Disable canonical mode and echo, but KEEP ISIG for Ctrl+C
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+            // Disable special input processing
+            raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+            // Set minimum chars and timeout for read
+            raw.c_cc[libc::VMIN] = 0;
+            raw.c_cc[libc::VTIME] = 0;
+            
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+        } else {
+            // Restore original settings
+            if SAVED {
+                libc::tcsetattr(fd, libc::TCSANOW, ORIG_TERMIOS.as_ptr());
+            }
+        }
+    }
+}
+
+fn run_emulator(system: &mut System) -> io::Result<()> {
+    let mut instructions: u64 = 0;
+    let max_cycles = 10_000_000_000u64; // 10 billion cycles = 1000 seconds at 10MHz
+    let mut stdin_buf = [0u8; 16];
+    
+    loop {
+        // Check for stdin input (non-blocking)
+        let n = unsafe {
+            libc::read(0, stdin_buf.as_mut_ptr() as *mut libc::c_void, stdin_buf.len())
+        };
+        if n > 0 {
+            for i in 0..n as usize {
+                // Convert CR to LF for consistency
+                let c = if stdin_buf[i] == b'\r' { b'\n' } else { stdin_buf[i] };
+                system.uart_receive(c);
+            }
+        }
+        
+        // Run a batch of cycles for performance
+        let cycles_to_run = 10000;
+        let cycles_run = system.run(cycles_to_run);
+        instructions += cycles_run as u64;
+        
+        // Handle UART Output
+        let output = system.uart_get_output();
+        if !output.is_empty() {
+            stdout().write_all(&output)?;
+            stdout().flush()?;
+        }
+
+        if system.cpu.pc == 0 {
+            println!("\nPC jumped to 0, halting.");
+            break;
+        }
+        
+        if instructions > max_cycles {
+            println!("\nTimeout reached, halting.");
+            break;
+        }
+
+        if cycles_run == 0 {
+            // WFI or halted
+            break;
+        }
+    }
+    
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut kernel_path = String::new();
@@ -14,6 +114,7 @@ fn main() -> io::Result<()> {
     let mut sig_begin = 0u32;
     let mut sig_end = 0u32;
     let mut raw_mode = false;
+    let mut fs_path = String::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -41,6 +142,10 @@ fn main() -> io::Result<()> {
             "--raw" => {
                 raw_mode = true;
             }
+            "--fs" => {
+                i += 1;
+                fs_path = args[i].clone();
+            }
             arg if !arg.starts_with("-") => {
                 kernel_path = arg.to_string();
             }
@@ -52,7 +157,7 @@ fn main() -> io::Result<()> {
     }
 
     if kernel_path.is_empty() {
-        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--signature <file> --begin <addr> --end <addr>] [--raw]", args[0]);
+        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw]", args[0]);
         std::process::exit(1);
     }
     
@@ -61,9 +166,13 @@ fn main() -> io::Result<()> {
     if !initrd_path.is_empty() {
         println!("Loading initrd: {}", initrd_path);
     }
+    if !fs_path.is_empty() {
+        println!("Mounting host path: {}", fs_path);
+    }
     println!("RAM Size: {} MB", ram_size_mb);
     
-    let mut system = System::new(ram_size_mb).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let fs_option = if !fs_path.is_empty() { Some(fs_path.as_str()) } else { None };
+    let mut system = System::new(ram_size_mb, fs_option).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     
     // Read kernel file
     let mut f = File::open(&kernel_path)?;
@@ -103,37 +212,18 @@ fn main() -> io::Result<()> {
     println!("System ready. Starting emulation...");
     println!("-------------------------------------");
     
-    let mut instructions: u64 = 0;
-    let max_cycles = 10_000_000_000u64; // 10 billion cycles = 1000 seconds at 10MHz
+    // Enable raw terminal mode for interactive input
+    set_raw_terminal(true);
+    set_nonblocking(0, true);
     
-    loop {
-        // Run a batch of cycles for performance
-        let cycles_to_run = 10000;
-        let cycles_run = system.run(cycles_to_run);
-        instructions += cycles_run as u64;
-        
-        // Handle UART Output
-        let output = system.uart_get_output();
-        if !output.is_empty() {
-             stdout().write_all(&output)?;
-             stdout().flush()?;
-        }
-
-        if system.cpu.pc == 0 {
-             println!("\nPC jumped to 0, halting.");
-             break;
-        }
-        
-        if instructions > max_cycles {
-             println!("\nTimeout reached, halting.");
-             break;
-        }
-
-        if cycles_run == 0 {
-             // WFI or halted
-             break;
-        }
-    }
+    // Ensure we restore terminal on exit
+    let result = run_emulator(&mut system);
+    
+    // Restore terminal
+    set_raw_terminal(false);
+    set_nonblocking(0, false);
+    
+    result?;
 
     // Dump signature if requested
     if !signature_file.is_empty() && sig_begin != 0 && sig_end != 0 {

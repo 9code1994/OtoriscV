@@ -281,6 +281,7 @@ pub fn mret(cpu: &mut Cpu) {
 pub fn sret(cpu: &mut Cpu) {
     // Restore privilege from SPP
     let spp = (cpu.csr.mstatus >> 8) & 1;
+    let old_priv = cpu.priv_level;
     cpu.priv_level = if spp == 1 { 
         PrivilegeLevel::Supervisor 
     } else { 

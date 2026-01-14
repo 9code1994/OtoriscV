@@ -6,7 +6,11 @@ use crate::cpu::Cpu;
 use crate::cpu::csr::*;
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
+use crate::devices::virtio_9p::{Backend, in_memory::InMemoryFileSystem};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::devices::virtio_9p::host::HostFileSystem;
 use serde::{Serialize, Deserialize};
+#[allow(unused_imports)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Device base addresses (matching jor1k)
@@ -38,8 +42,8 @@ pub struct System {
 }
 
 impl System {
-    /// Create a new system with the specified RAM size
-    pub fn new(ram_size_mb: u32) -> Result<Self, String> {
+    /// Create a new system with the specified RAM size and optional host FS path
+    pub fn new(ram_size_mb: u32, fs_path: Option<&str>) -> Result<Self, String> {
         if ram_size_mb == 0 || ram_size_mb > 2048 {
             return Err(format!("Invalid RAM size: {}MB", ram_size_mb));
         }
@@ -47,13 +51,27 @@ impl System {
         let mut memory = Memory::new(ram_size_mb);
         memory.init_boot_rom();
         
+        let fs_backend = if let Some(_path) = fs_path {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                Backend::Host(HostFileSystem::new(_path))
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Host filesystem not available on WASM, use in-memory
+                Backend::InMemory(InMemoryFileSystem::new())
+            }
+        } else {
+            Backend::InMemory(InMemoryFileSystem::new())
+        };
+
         Ok(System {
             cpu: Cpu::new(),
             memory,
             uart: Uart::new(UART_IRQ),
             clint: Clint::new(),
             plic: Plic::new(),
-            virtio9p: Virtio9p::new("rootfs"),
+            virtio9p: Virtio9p::new("rootfs", fs_backend),
         })
     }
     
@@ -162,10 +180,18 @@ impl System {
                 self.cpu.handle_trap(trap);
             }
             
-            // If waiting for interrupt, don't execute
+            // If waiting for interrupt, check if any interrupt is pending
+            // WFI wakes when (mip & mie) != 0, regardless of global enables
             if self.cpu.wfi {
-                cycles += 1;
-                continue;
+                let pending = self.cpu.csr.mip & self.cpu.csr.mie;
+                if pending != 0 {
+                    self.cpu.wfi = false;
+                    // The interrupt will be handled on next iteration
+                    // (or the kernel will poll and see data available)
+                } else {
+                    cycles += 1;
+                    continue;
+                }
             }
             
             // Execute one instruction with device access
@@ -579,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_setup_linux_boot() {
-        let mut sys = System::new(16).unwrap(); // 16MB RAM
+        let mut sys = System::new(16, None).unwrap(); // 16MB RAM
         let dummy_kernel = vec![0x13, 0x00, 0x00, 0x00]; // NOP
         
         // Should succeed

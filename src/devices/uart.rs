@@ -79,6 +79,12 @@ impl Uart {
     
     /// Receive a character from host (keyboard input)
     pub fn receive_char(&mut self, c: u8) {
+        // Limit FIFO size to prevent memory issues with flooding
+        const MAX_FIFO_SIZE: usize = 256;
+        if self.rx_fifo.len() >= MAX_FIFO_SIZE {
+            // Drop oldest character (overflow behavior)
+            self.rx_fifo.pop_front();
+        }
         self.rx_fifo.push_back(c);
         // Set RX data available interrupt flag
         self.interrupt_flags |= IIR_RX_AVAILABLE;
@@ -182,6 +188,7 @@ impl Uart {
                 if self.is_dlab_set() {
                     self.divisor = (self.divisor & 0x00FF) | ((value as u16) << 8);
                 } else {
+                    let old_ier = self.ier;
                     self.ier = value & 0x0F;
                     // Writing to IER clears THRI flag (as per jor1k behavior)
                     self.interrupt_flags &= !IIR_TX_EMPTY;

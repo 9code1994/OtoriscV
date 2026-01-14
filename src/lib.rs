@@ -64,7 +64,7 @@ impl Emulator {
     pub fn new(memory_size_mb: u32) -> Result<Emulator, JsValue> {
         console_log!("Creating RISC-V emulator with {}MB RAM", memory_size_mb);
         
-        let system = System::new(memory_size_mb)
+        let system = System::new(memory_size_mb, None)
             .map_err(|e| JsValue::from_str(&e))?;
         
         Ok(Emulator { system })
@@ -79,6 +79,12 @@ impl Emulator {
     /// Setup Linux boot (generates DTB and sets up registers)
     pub fn setup_linux(&mut self, kernel: &[u8], cmdline: &str) -> Result<(), JsValue> {
         self.system.setup_linux_boot(kernel, cmdline)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+    
+    /// Setup Linux boot with initrd (generates DTB and sets up registers)
+    pub fn setup_linux_with_initrd(&mut self, kernel: &[u8], initrd: &[u8], cmdline: &str) -> Result<(), JsValue> {
+        self.system.setup_linux_boot_with_initrd(kernel, Some(initrd), cmdline)
             .map_err(|e| JsValue::from_str(&e))
     }
     

@@ -83,7 +83,11 @@ impl Plic {
             
             if (self.pending[idx] & bit) != 0 && (self.enable[context][idx] & bit) != 0 {
                 let priority = self.priorities[irq as usize];
-                if priority > self.threshold[context] && priority > best_priority {
+                // Priority 0 means "never interrupt" per PLIC spec
+                // But for enabled interrupts with priority > 0, compare against threshold
+                // Note: if priority == 0, the interrupt is effectively disabled
+                // Many systems set priority=1 for all interrupts they want to enable
+                if priority > 0 && priority > self.threshold[context] && priority >= best_priority {
                     best_priority = priority;
                     best_irq = Some(irq);
                 }
@@ -118,7 +122,7 @@ impl Plic {
         self.update_external_interrupts();
     }
 
-    pub fn read8(&self, offset: u32) -> u8 {
+    pub fn read8(&mut self, offset: u32) -> u8 {
         let word_offset = offset & !3;
         let byte_offset = offset & 3;
         let word = self.read32(word_offset);
@@ -134,7 +138,7 @@ impl Plic {
         self.write32(word_offset, word);
     }
     
-    pub fn read32(&self, offset: u32) -> u32 {
+    pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             o if o < 0x1000 => {
                 let irq = o / 4;
@@ -165,7 +169,7 @@ impl Plic {
                 if context >= MAX_CONTEXTS { return 0; }
                 match reg {
                     0 => self.threshold[context] as u32,
-                    4 => self.claimed[context],
+                    4 => self.claim(context),
                     _ => 0,
                 }
             }
