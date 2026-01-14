@@ -377,8 +377,9 @@ impl Cpu {
                         return Ok(());
                     }
                     _ => {
-                        // SFENCE.VMA - treat as no-op for now
+                        // SFENCE.VMA
                         if (inst >> 25) == 0b0001001 {
+                            self.mmu.invalidate();
                             self.pc = self.pc.wrapping_add(4);
                             return Ok(());
                         }
@@ -432,6 +433,9 @@ impl Cpu {
                             self.csr.mstatus |= MSTATUS_FS;
                         }
                         _ => {
+                            if csr_addr == CSR_SATP && new_val != old_val {
+                                self.mmu.invalidate();
+                            }
                             if !self.csr.write(csr_addr, new_val, self.priv_level) {
                                 return Err(Trap::IllegalInstruction(inst));
                             }

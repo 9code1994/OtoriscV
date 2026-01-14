@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write, stdout};
+use std::time::{Duration, Instant};
 
 // Use the library crate's modules
 use otoriscv::System;
@@ -56,10 +57,30 @@ fn set_raw_terminal(enable: bool) {
     }
 }
 
-fn run_emulator(system: &mut System) -> io::Result<()> {
+struct BenchmarkConfig {
+    enabled: bool,
+    exit_on_prompt: bool,
+}
+
+struct BenchmarkResult {
+    wall_time: Duration,
+    boot_time: Option<Duration>,
+    instructions: u64,
+}
+
+fn output_has_prompt(buffer: &[u8]) -> bool {
+    const PROMPTS: [&[u8]; 4] = [b"\n# ", b"\n$ ", b"\n~ $", b"\n~# "];
+    PROMPTS.iter().any(|pat| buffer.windows(pat.len()).any(|w| w == *pat))
+}
+
+fn run_emulator(system: &mut System, benchmark: &BenchmarkConfig) -> io::Result<BenchmarkResult> {
+    let start = Instant::now();
+    let mut boot_time: Option<Duration> = None;
     let mut instructions: u64 = 0;
     let max_cycles = 10_000_000_000u64; // 10 billion cycles = 1000 seconds at 10MHz
     let mut stdin_buf = [0u8; 16];
+    let mut prompt_buffer: Vec<u8> = Vec::new();
+    const PROMPT_BUFFER_MAX: usize = 128;
     
     loop {
         // Check for stdin input (non-blocking)
@@ -84,6 +105,19 @@ fn run_emulator(system: &mut System) -> io::Result<()> {
         if !output.is_empty() {
             stdout().write_all(&output)?;
             stdout().flush()?;
+            if benchmark.enabled && boot_time.is_none() {
+                prompt_buffer.extend_from_slice(&output);
+                if prompt_buffer.len() > PROMPT_BUFFER_MAX {
+                    let excess = prompt_buffer.len() - PROMPT_BUFFER_MAX;
+                    prompt_buffer.drain(0..excess);
+                }
+                if output_has_prompt(&prompt_buffer) {
+                    boot_time = Some(start.elapsed());
+                    if benchmark.exit_on_prompt {
+                        break;
+                    }
+                }
+            }
         }
 
         if system.cpu.pc == 0 {
@@ -102,7 +136,11 @@ fn run_emulator(system: &mut System) -> io::Result<()> {
         }
     }
     
-    Ok(())
+    Ok(BenchmarkResult {
+        wall_time: start.elapsed(),
+        boot_time,
+        instructions: system.get_instruction_count(),
+    })
 }
 
 fn main() -> io::Result<()> {
@@ -115,6 +153,10 @@ fn main() -> io::Result<()> {
     let mut sig_end = 0u32;
     let mut raw_mode = false;
     let mut fs_path = String::new();
+    let mut benchmark = BenchmarkConfig {
+        enabled: false,
+        exit_on_prompt: false,
+    };
 
     let mut i = 1;
     while i < args.len() {
@@ -142,6 +184,10 @@ fn main() -> io::Result<()> {
             "--raw" => {
                 raw_mode = true;
             }
+            "--benchmark" => {
+                benchmark.enabled = true;
+                benchmark.exit_on_prompt = true;
+            }
             "--fs" => {
                 i += 1;
                 fs_path = args[i].clone();
@@ -157,7 +203,7 @@ fn main() -> io::Result<()> {
     }
 
     if kernel_path.is_empty() {
-        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw]", args[0]);
+        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark]", args[0]);
         std::process::exit(1);
     }
     
@@ -217,13 +263,42 @@ fn main() -> io::Result<()> {
     set_nonblocking(0, true);
     
     // Ensure we restore terminal on exit
-    let result = run_emulator(&mut system);
+    let result = run_emulator(&mut system, &benchmark);
     
     // Restore terminal
     set_raw_terminal(false);
     set_nonblocking(0, false);
     
-    result?;
+    let bench_result = result?;
+
+    if benchmark.enabled {
+        let wall_secs = bench_result.wall_time.as_secs_f64();
+        let ips = if wall_secs > 0.0 {
+            (bench_result.instructions as f64) / wall_secs
+        } else {
+            0.0
+        };
+        let (tlb_hits, tlb_misses) = system.get_tlb_stats();
+        let tlb_total = tlb_hits + tlb_misses;
+        let tlb_hit_rate = if tlb_total > 0 {
+            (tlb_hits as f64) / (tlb_total as f64)
+        } else {
+            0.0
+        };
+        println!("\nBenchmark results:");
+        if let Some(bt) = bench_result.boot_time {
+            println!("  Boot time: {:.3}s", bt.as_secs_f64());
+        } else {
+            println!("  Boot time: N/A (prompt not detected)");
+        }
+        println!("  Instructions: {}", bench_result.instructions);
+        println!("  IPS: {:.3}", ips);
+        if tlb_total > 0 {
+            println!("  TLB hit rate: {:.3}", tlb_hit_rate);
+        } else {
+            println!("  TLB hit rate: N/A (paging disabled)");
+        }
+    }
 
     // Dump signature if requested
     if !signature_file.is_empty() && sig_begin != 0 && sig_end != 0 {

@@ -14,17 +14,62 @@ pub enum AccessType {
     Store,
 }
 
+const TLB_SIZE: usize = 16;
+
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    tag: u32,
+    ppn: u32,
+    perm: u8,
+    valid: bool,
+    generation: u32,
+    page_shift: u8,
+}
+
+impl TlbEntry {
+    const fn empty() -> Self {
+        TlbEntry {
+            tag: 0,
+            ppn: 0,
+            perm: 0,
+            valid: false,
+            generation: 0,
+            page_shift: 12,
+        }
+    }
+}
+
 /// MMU State
-#[derive(Default)] // We'll add Serialize/Deserialize later
 pub struct Mmu {
-    /// Helper to store effective privilege mode if different from CPU priv
-    /// (e.g. MPRV bit in MSTATUS) - typically handled by caller passing correct priv
-    _dummy: u32, 
+    tlb: [TlbEntry; TLB_SIZE],
+    tlb_generation: u32,
+    tlb_hits: u64,
+    tlb_misses: u64,
 }
 
 impl Mmu {
     pub fn new() -> Self {
-        Mmu { _dummy: 0 }
+        Mmu {
+            tlb: [TlbEntry::empty(); TLB_SIZE],
+            tlb_generation: 1,
+            tlb_hits: 0,
+            tlb_misses: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.tlb = [TlbEntry::empty(); TLB_SIZE];
+        self.tlb_generation = 1;
+        self.tlb_hits = 0;
+        self.tlb_misses = 0;
+    }
+
+    pub fn invalidate(&mut self) {
+        self.tlb_generation = self.tlb_generation.wrapping_add(1);
+    }
+
+    pub fn tlb_stats(&self) -> (u64, u64) {
+        (self.tlb_hits, self.tlb_misses)
     }
 
     /// Translate a virtual address to a physical address
@@ -43,7 +88,11 @@ impl Mmu {
             return Ok(vaddr);
         }
 
-        // 2. Sv32 Translation
+        if let Some(paddr) = self.tlb_lookup(vaddr, access_type, priv_level, mstatus) {
+            return Ok(paddr);
+        }
+
+        // 2. Sv32 Translation (slow path)
         let ppn = satp & 0x3FFFFF;
         let root_page_table = ppn << 12;
 
@@ -64,6 +113,7 @@ impl Mmu {
         let r = (pte1 >> 1) & 1;
         let w = (pte1 >> 2) & 1;
         let x = (pte1 >> 3) & 1;
+        let u = (pte1 >> 4) & 1;
 
         if (r == 1) || (x == 1) {
             // Megapage (4MB)
@@ -82,6 +132,10 @@ impl Mmu {
             if self.update_ad_bits(bus, pte1_addr, pte1, access_type)? {
                 // If we wrote back, need to consider TLB flush if we had one
             }
+
+            let perm = ((r as u8) << 0) | ((w as u8) << 1) | ((x as u8) << 2) | ((u as u8) << 3);
+            let tag = vaddr >> 22;
+            self.fill_tlb(tag, phys_ppn1, perm, 22);
             
             return Ok(paddr);
         }
@@ -97,7 +151,9 @@ impl Mmu {
         
         // Leaf PTE check (Level 0 MUST be leaf)
         let r0 = (pte0 >> 1) & 1;
+        let w0 = (pte0 >> 2) & 1;
         let x0 = (pte0 >> 3) & 1;
+        let u0 = (pte0 >> 4) & 1;
         if (r0 == 0) && (x0 == 0) {
              return Err(self.page_fault_cause(access_type)); 
         }
@@ -112,7 +168,64 @@ impl Mmu {
         // Update A/D bits
         self.update_ad_bits(bus, pte0_addr, pte0, access_type)?;
 
+        let perm = ((r0 as u8) << 0) | ((w0 as u8) << 1) | ((x0 as u8) << 2) | ((u0 as u8) << 3);
+        let tag = vaddr >> 12;
+        self.fill_tlb(tag, ppn, perm, 12);
+
         Ok(paddr)
+    }
+
+    fn tlb_lookup(&mut self, vaddr: u32, access_type: AccessType, priv_level: PrivilegeLevel, mstatus: u32) -> Option<u32> {
+        // Check 4KB entry first
+        let tag_4k = vaddr >> 12;
+        let idx_4k = (tag_4k as usize) & (TLB_SIZE - 1);
+        if let Some(paddr) = self.tlb_match(idx_4k, tag_4k, 12, vaddr, access_type, priv_level, mstatus) {
+            self.tlb_hits += 1;
+            return Some(paddr);
+        }
+
+        // Check 4MB entry
+        let tag_4m = vaddr >> 22;
+        let idx_4m = (tag_4m as usize) & (TLB_SIZE - 1);
+        if let Some(paddr) = self.tlb_match(idx_4m, tag_4m, 22, vaddr, access_type, priv_level, mstatus) {
+            self.tlb_hits += 1;
+            return Some(paddr);
+        }
+
+        self.tlb_misses += 1;
+        None
+    }
+
+    fn tlb_match(&self, idx: usize, tag: u32, page_shift: u8, vaddr: u32, access_type: AccessType, priv_level: PrivilegeLevel, mstatus: u32) -> Option<u32> {
+        let entry = self.tlb[idx];
+        if !entry.valid || entry.generation != self.tlb_generation {
+            return None;
+        }
+        if entry.tag != tag || entry.page_shift != page_shift {
+            return None;
+        }
+        if !self.check_perm_fast(entry.perm, access_type, priv_level, mstatus) {
+            return None;
+        }
+
+        let paddr = match entry.page_shift {
+            12 => (entry.ppn << 12) | (vaddr & 0x0FFF),
+            22 => (entry.ppn << 22) | (vaddr & 0x003F_FFFF),
+            _ => return None,
+        };
+        Some(paddr)
+    }
+
+    fn fill_tlb(&mut self, tag: u32, ppn: u32, perm: u8, page_shift: u8) {
+        let idx = (tag as usize) & (TLB_SIZE - 1);
+        self.tlb[idx] = TlbEntry {
+            tag,
+            ppn,
+            perm,
+            valid: true,
+            generation: self.tlb_generation,
+            page_shift,
+        };
     }
     
     fn check_permissions(&self, pte: u32, access_type: AccessType, priv_level: PrivilegeLevel, mstatus: u32) -> Result<(), u32> {
@@ -159,6 +272,32 @@ impl Mmu {
         }
         Ok(())
     }
+
+    fn check_perm_fast(&self, perm: u8, access_type: AccessType, priv_level: PrivilegeLevel, mstatus: u32) -> bool {
+        let r = (perm & 0x01) != 0;
+        let w = (perm & 0x02) != 0;
+        let x = (perm & 0x04) != 0;
+        let u = (perm & 0x08) != 0;
+
+        if priv_level == PrivilegeLevel::Supervisor && u {
+            let sum = (mstatus >> 18) & 1;
+            if sum == 0 {
+                return false;
+            }
+        }
+
+        if priv_level == PrivilegeLevel::User && !u {
+            return false;
+        }
+
+        let mxr = (mstatus >> 19) & 1;
+
+        match access_type {
+            AccessType::Instruction => x,
+            AccessType::Load => r || (x && mxr == 1),
+            AccessType::Store => w,
+        }
+    }
     
     fn update_ad_bits(&self, bus: &mut impl Bus, pte_addr: u32, pte: u32, access_type: AccessType) -> Result<bool, u32> {
         let mut new_pte = pte;
@@ -192,5 +331,11 @@ impl Mmu {
             AccessType::Load => 13,
             AccessType::Store => 15,
         }
+    }
+}
+
+impl Default for Mmu {
+    fn default() -> Self {
+        Mmu::new()
     }
 }

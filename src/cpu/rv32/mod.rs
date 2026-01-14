@@ -125,6 +125,11 @@ impl Cpu {
         self.priv_level = PrivilegeLevel::Machine;
         self.wfi = false;
         self.reservation = None;
+        self.mmu.reset();
+    }
+
+    pub fn tlb_stats(&self) -> (u64, u64) {
+        self.mmu.tlb_stats()
     }
     
     /// Check for pending interrupts and handle if any

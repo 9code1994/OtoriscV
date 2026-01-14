@@ -434,6 +434,10 @@ impl System {
         self.cpu.instruction_count
     }
 
+    pub fn get_tlb_stats(&self) -> (u64, u64) {
+        self.cpu.tlb_stats()
+    }
+
     /// Get all register values (x0-x31)
     pub fn get_registers(&self) -> Vec<u32> {
         self.cpu.regs.to_vec()
