@@ -4,7 +4,7 @@
 
 use crate::cpu::Cpu;
 use crate::cpu::csr::*;
-use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType};
+use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType, run_fast_loop};
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
 use crate::devices::virtio_9p::{Backend, in_memory::InMemoryFileSystem};
@@ -242,6 +242,42 @@ impl System {
         }
         
         cycles
+    }
+    
+    /// Run with giant inline switch for maximum performance
+    /// Falls back to slow path for FP and complex instructions
+    pub fn run_fast(&mut self, max_cycles: u32) -> u32 {
+        let mut total_cycles = 0u32;
+        let mut remaining = max_cycles;
+        
+        while remaining > 0 {
+            let cycles = run_fast_loop(
+                &mut self.cpu,
+                &mut self.memory,
+                &mut self.uart,
+                &mut self.clint,
+                &mut self.plic,
+                &mut self.virtio9p,
+                remaining,
+            );
+            
+            total_cycles += cycles;
+            remaining = remaining.saturating_sub(cycles);
+            
+            // Handle pending SBI call
+            if self.cpu.pending_sbi_call {
+                self.cpu.pending_sbi_call = false;
+                self.handle_sbi_call();
+                // Continue looping after SBI
+            }
+            
+            // If cycles == 0, CPU is halted (WFI) - break out
+            if cycles == 0 {
+                break;
+            }
+        }
+        
+        total_cycles
     }
     
     /// Execute a basic block, returning number of instructions executed

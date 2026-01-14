@@ -60,6 +60,7 @@ fn set_raw_terminal(enable: bool) {
 struct BenchmarkConfig {
     enabled: bool,
     exit_on_prompt: bool,
+    fast_mode: bool,
 }
 
 struct BenchmarkResult {
@@ -73,7 +74,7 @@ fn output_has_prompt(buffer: &[u8]) -> bool {
     PROMPTS.iter().any(|pat| buffer.windows(pat.len()).any(|w| w == *pat))
 }
 
-fn run_emulator(system: &mut System, benchmark: &BenchmarkConfig) -> io::Result<BenchmarkResult> {
+fn run_emulator(system: &mut System, config: &BenchmarkConfig) -> io::Result<BenchmarkResult> {
     let start = Instant::now();
     let mut boot_time: Option<Duration> = None;
     let mut instructions: u64 = 0;
@@ -95,9 +96,13 @@ fn run_emulator(system: &mut System, benchmark: &BenchmarkConfig) -> io::Result<
             }
         }
         
-        // Run a batch of cycles for performance
+        // Run a batch of cycles
         let cycles_to_run = 10000;
-        let cycles_run = system.run(cycles_to_run);
+        let cycles_run = if config.fast_mode {
+            system.run_fast(cycles_to_run)
+        } else {
+            system.run(cycles_to_run)
+        };
         instructions += cycles_run as u64;
         
         // Handle UART Output
@@ -105,7 +110,7 @@ fn run_emulator(system: &mut System, benchmark: &BenchmarkConfig) -> io::Result<
         if !output.is_empty() {
             stdout().write_all(&output)?;
             stdout().flush()?;
-            if benchmark.enabled && boot_time.is_none() {
+            if config.enabled && boot_time.is_none() {
                 prompt_buffer.extend_from_slice(&output);
                 if prompt_buffer.len() > PROMPT_BUFFER_MAX {
                     let excess = prompt_buffer.len() - PROMPT_BUFFER_MAX;
@@ -113,7 +118,7 @@ fn run_emulator(system: &mut System, benchmark: &BenchmarkConfig) -> io::Result<
                 }
                 if output_has_prompt(&prompt_buffer) {
                     boot_time = Some(start.elapsed());
-                    if benchmark.exit_on_prompt {
+                    if config.exit_on_prompt {
                         break;
                     }
                 }
@@ -153,9 +158,10 @@ fn main() -> io::Result<()> {
     let mut sig_end = 0u32;
     let mut raw_mode = false;
     let mut fs_path = String::new();
-    let mut benchmark = BenchmarkConfig {
+    let mut config = BenchmarkConfig {
         enabled: false,
         exit_on_prompt: false,
+        fast_mode: false,
     };
 
     let mut i = 1;
@@ -185,8 +191,11 @@ fn main() -> io::Result<()> {
                 raw_mode = true;
             }
             "--benchmark" => {
-                benchmark.enabled = true;
-                benchmark.exit_on_prompt = true;
+                config.enabled = true;
+                config.exit_on_prompt = true;
+            }
+            "--still-broken-fast-mode" => {
+                config.fast_mode = true;
             }
             "--fs" => {
                 i += 1;
@@ -203,7 +212,7 @@ fn main() -> io::Result<()> {
     }
 
     if kernel_path.is_empty() {
-        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark]", args[0]);
+        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark] [--still-broken-fast-mode]", args[0]);
         std::process::exit(1);
     }
     
@@ -263,7 +272,7 @@ fn main() -> io::Result<()> {
     set_nonblocking(0, true);
     
     // Ensure we restore terminal on exit
-    let result = run_emulator(&mut system, &benchmark);
+    let result = run_emulator(&mut system, &config);
     
     // Restore terminal
     set_raw_terminal(false);
@@ -271,7 +280,7 @@ fn main() -> io::Result<()> {
     
     let bench_result = result?;
 
-    if benchmark.enabled {
+    if config.enabled {
         let wall_secs = bench_result.wall_time.as_secs_f64();
         let ips = if wall_secs > 0.0 {
             (bench_result.instructions as f64) / wall_secs

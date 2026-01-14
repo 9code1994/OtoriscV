@@ -11,11 +11,13 @@ mod execute_fp;
 pub mod mmu;
 pub mod icache;
 pub mod bb_jit;
+pub mod run_fast;
 
 pub use csr::Csr;
 pub use mmu::Mmu;
 pub use icache::{ICache, CachedInst};
 pub use bb_jit::{BlockCache, BlockResult, execute_block};
+pub use run_fast::run_fast as run_fast_loop;
 
 use super::PrivilegeLevel;
 use super::fpu::Fpu;
@@ -54,9 +56,13 @@ pub struct Cpu {
     #[serde(skip)]
     pub icache: ICache,
 
+
     /// Flag set when instruction cache needs invalidation (FENCE.I, SFENCE.VMA)
     /// System should clear this after invalidating block cache
     pub cache_invalidation_pending: bool,
+
+    /// Flag set when run_fast encounters an SBI call that needs System handling
+    pub pending_sbi_call: bool,
 
     // Debugging helpers
     pub last_write_addr: u32,
@@ -77,6 +83,7 @@ impl Cpu {
             mmu: Mmu::new(),
             icache: ICache::new(),
             cache_invalidation_pending: false,
+            pending_sbi_call: false,
             last_write_addr: 0,
             last_write_val: 0,
         };
