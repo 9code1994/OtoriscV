@@ -178,6 +178,7 @@ dependencies = [
  "bincode",
  "console_error_panic_hook",
  "js-sys",
+ "libc",
  "serde",
  "serde-wasm-bindgen",
  "wasm-bindgen",
