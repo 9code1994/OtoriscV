@@ -5,6 +5,7 @@
 use crate::cpu::Cpu;
 use crate::cpu::csr::*;
 use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType, run_fast_loop};
+use crate::cpu::rv32::bb_jit_v2::{JitState, RegionResult, execute_region, HEAT_PER_BLOCK, Page};
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
 use crate::devices::virtio_9p::{Backend, in_memory::InMemoryFileSystem};
@@ -41,9 +42,17 @@ pub struct System {
     plic: Plic,
     virtio9p: Virtio9p,
     
-    // Basic block cache for JIT
+    // Basic block cache for JIT (v1)
     #[serde(skip)]
     block_cache: BlockCache,
+    
+    // Advanced JIT state (v2) - page-based with CFG optimization
+    #[serde(skip)]
+    jit_state: JitState,
+    
+    // Use JIT v2 instead of v1
+    #[serde(skip)]
+    use_jit_v2: bool,
 }
 
 impl System {
@@ -78,7 +87,14 @@ impl System {
             plic: Plic::new(),
             virtio9p: Virtio9p::new("rootfs", fs_backend),
             block_cache: BlockCache::new(),
+            jit_state: JitState::new(),
+            use_jit_v2: false, // Default to v1 for backward compatibility
         })
+    }
+    
+    /// Enable JIT v2 (advanced page-based JIT with CFG optimization)
+    pub fn enable_jit_v2(&mut self, enable: bool) {
+        self.use_jit_v2 = enable;
     }
     
     /// Load a binary at the specified address
@@ -194,6 +210,7 @@ impl System {
             // Check for cache invalidation request from CPU (FENCE.I, SFENCE.VMA)
             if self.cpu.cache_invalidation_pending {
                 self.block_cache.invalidate_all();
+                self.jit_state.invalidate_all();
                 self.cpu.cache_invalidation_pending = false;
             }
             
@@ -282,6 +299,15 @@ impl System {
     
     /// Execute a basic block, returning number of instructions executed
     fn step_block(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
+        if self.use_jit_v2 {
+            self.step_block_v2()
+        } else {
+            self.step_block_v1()
+        }
+    }
+    
+    /// Execute using JIT v1 (simple block cache)
+    fn step_block_v1(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
         // Translate PC to physical address
         let satp = self.cpu.csr.satp;
         let mstatus = self.cpu.csr.mstatus;
@@ -364,6 +390,79 @@ impl System {
                     result.map(|_| 1)
                 }
             }
+        }
+    }
+    
+    /// Execute using JIT v2 (page-based with CFG optimization)
+    fn step_block_v2(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
+        // Translate PC to physical address
+        let satp = self.cpu.csr.satp;
+        let mstatus = self.cpu.csr.mstatus;
+        let priv_level = self.cpu.priv_level;
+        
+        // Create bus for translation
+        let mut bus = SystemBus::new(
+            &mut self.memory,
+            &mut self.uart,
+            &mut self.clint,
+            &mut self.plic,
+            &mut self.virtio9p,
+        );
+        
+        let paddr = match self.cpu.mmu.translate(
+            self.cpu.pc, 
+            AccessType::Instruction, 
+            priv_level, 
+            &mut bus, 
+            satp, 
+            mstatus
+        ) {
+            Ok(pa) => pa,
+            Err(cause) => {
+                return Err(crate::cpu::trap::Trap::from_cause(cause, self.cpu.pc));
+            }
+        };
+        
+        // Record execution for hotness tracking
+        let page = Page::of(paddr);
+        if let Some(hot_page) = self.jit_state.record_execution(paddr, HEAT_PER_BLOCK) {
+            // Page became hot - compile the region
+            self.jit_state.compile_region(&mut bus, hot_page);
+        }
+        
+        // Try to execute using compiled region
+        if let Some(region) = self.jit_state.get_region(page) {
+            // Execute the compiled region
+            match execute_region(&mut self.cpu, &mut bus, region) {
+                RegionResult::Continue(next_pc) => {
+                    self.cpu.pc = next_pc;
+                    // Estimate instructions executed based on blocks in region
+                    let inst_count = region.blocks.values()
+                        .map(|b| b.instructions.len())
+                        .sum::<usize>() as u32;
+                    let inst_count = inst_count.max(1);
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count += inst_count as u64;
+                    Ok(inst_count)
+                }
+                RegionResult::Exit(next_pc) => {
+                    self.cpu.pc = next_pc;
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count += 1;
+                    Ok(1)
+                }
+                RegionResult::Trap(trap) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    Err(trap)
+                }
+            }
+        } else {
+            // No compiled region yet - fallback to v1 execution
+            drop(bus);
+            self.step_block_v1()
         }
     }
     

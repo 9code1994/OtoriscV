@@ -11,6 +11,7 @@ mod execute_fp;
 pub mod mmu;
 pub mod icache;
 pub mod bb_jit;
+pub mod bb_jit_v2;
 pub mod run_fast;
 
 pub use csr::Csr;

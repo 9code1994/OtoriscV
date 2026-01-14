@@ -94,6 +94,16 @@ impl Emulator {
         self.system.run(cycles)
     }
     
+    /// Run with optimized loop (fast path)
+    pub fn run_fast(&mut self, cycles: u32) -> u32 {
+        self.system.run_fast(cycles)
+    }
+    
+    /// Enable or disable JIT v2 (advanced page-based JIT with CFG optimization)
+    pub fn enable_jit_v2(&mut self, enable: bool) {
+        self.system.enable_jit_v2(enable);
+    }
+    
     /// Check if the CPU is halted (waiting for interrupt)
     pub fn is_halted(&self) -> bool {
         self.system.is_halted()
