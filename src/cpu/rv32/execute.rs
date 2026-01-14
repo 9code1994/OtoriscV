@@ -246,7 +246,14 @@ impl Cpu {
             }
             
             OP_MISC_MEM => {
-                // FENCE instructions - no-op in simple implementation
+                // FENCE and FENCE.I instructions
+                // funct3 == 0: FENCE (memory ordering - no-op in simple implementation)
+                // funct3 == 1: FENCE.I (instruction cache synchronization)
+                if d.funct3 == 1 {
+                    // FENCE.I - invalidate instruction cache
+                    self.icache.invalidate_all();
+                    self.cache_invalidation_pending = true;
+                }
                 self.pc = self.pc.wrapping_add(4);
             }
             
@@ -389,6 +396,8 @@ impl Cpu {
                         // SFENCE.VMA
                         if (inst >> 25) == 0b0001001 {
                             self.mmu.invalidate();
+                            self.icache.invalidate_all();
+                            self.cache_invalidation_pending = true;
                             self.pc = self.pc.wrapping_add(4);
                             return Ok(());
                         }

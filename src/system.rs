@@ -4,6 +4,7 @@
 
 use crate::cpu::Cpu;
 use crate::cpu::csr::*;
+use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType};
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
 use crate::devices::virtio_9p::{Backend, in_memory::InMemoryFileSystem};
@@ -39,6 +40,10 @@ pub struct System {
     pub clint: Clint,
     plic: Plic,
     virtio9p: Virtio9p,
+    
+    // Basic block cache for JIT
+    #[serde(skip)]
+    block_cache: BlockCache,
 }
 
 impl System {
@@ -72,6 +77,7 @@ impl System {
             clint: Clint::new(),
             plic: Plic::new(),
             virtio9p: Virtio9p::new("rootfs", fs_backend),
+            block_cache: BlockCache::new(),
         })
     }
     
@@ -172,6 +178,12 @@ impl System {
             self.clint.tick(1);
             self.cpu.csr.time = self.clint.get_mtime();
             
+            // Check for cache invalidation request from CPU (FENCE.I, SFENCE.VMA)
+            if self.cpu.cache_invalidation_pending {
+                self.block_cache.invalidate_all();
+                self.cpu.cache_invalidation_pending = false;
+            }
+            
             // Check for interrupts
             self.update_interrupts();
             
@@ -205,9 +217,12 @@ impl System {
                 }
             }
             
-            // Execute one instruction with device access
-            match self.step_with_devices() {
-                Ok(()) => {}
+            // Try block-based execution
+            match self.step_block() {
+                Ok(inst_count) => {
+                    cycles += inst_count;
+                    self.cpu.csr.cycle = self.cpu.csr.cycle.wrapping_add(inst_count as u64);
+                }
                 Err(trap) => {
                     // Handle SBI calls from S-mode directly in Rust
                     if let crate::cpu::trap::Trap::EnvironmentCallFromS = trap {
@@ -215,14 +230,100 @@ impl System {
                     } else {
                         self.cpu.handle_trap(trap);
                     }
+                    cycles += 1;
+                    self.cpu.csr.cycle = self.cpu.csr.cycle.wrapping_add(1);
                 }
             }
-            
-            cycles += 1;
-            self.cpu.csr.cycle = self.cpu.csr.cycle.wrapping_add(1);
         }
         
         cycles
+    }
+    
+    /// Execute a basic block, returning number of instructions executed
+    fn step_block(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
+        // Translate PC to physical address
+        let satp = self.cpu.csr.satp;
+        let mstatus = self.cpu.csr.mstatus;
+        let priv_level = self.cpu.priv_level;
+        
+        // Create bus for translation
+        let mut bus = SystemBus {
+            memory: &mut self.memory,
+            uart: &mut self.uart,
+            clint: &mut self.clint,
+            plic: &mut self.plic,
+            virtio9p: &mut self.virtio9p,
+        };
+        
+        let paddr = match self.cpu.mmu.translate(
+            self.cpu.pc, 
+            AccessType::Instruction, 
+            priv_level, 
+            &mut bus, 
+            satp, 
+            mstatus
+        ) {
+            Ok(pa) => pa,
+            Err(cause) => {
+                return Err(crate::cpu::trap::Trap::from_cause(cause, self.cpu.pc));
+            }
+        };
+        
+        // Try to get cached block
+        let block_exists = self.block_cache.get(paddr).is_some();
+        
+        if block_exists {
+            // Re-borrow to satisfy borrow checker
+            let block = self.block_cache.get_block(paddr).unwrap();
+            let inst_count = block.inst_count;
+            
+            // Execute the block
+            match execute_block(&mut self.cpu, block, &mut bus) {
+                BlockResult::Continue(_) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count += inst_count as u64;
+                    Ok(inst_count)
+                }
+                BlockResult::Trap(trap) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    Err(trap)
+                }
+                BlockResult::Interpret => {
+                    // Fallback to single-step
+                    drop(bus);
+                    let result = self.step_with_devices();
+                    result.map(|_| 1)
+                }
+            }
+        } else {
+            // Compile new block
+            self.block_cache.compile_block(&mut bus, paddr);
+            let block = self.block_cache.get_block(paddr).unwrap();
+            let inst_count = block.inst_count;
+            
+            // Execute the newly compiled block
+            match execute_block(&mut self.cpu, block, &mut bus) {
+                BlockResult::Continue(_) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count += inst_count as u64;
+                    Ok(inst_count)
+                }
+                BlockResult::Trap(trap) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    Err(trap)
+                }
+                BlockResult::Interpret => {
+                    // Fallback to single-step
+                    drop(bus);
+                    let result = self.step_with_devices();
+                    result.map(|_| 1)
+                }
+            }
+        }
     }
     
     /// Execute one instruction, handling device I/O specially
