@@ -11,13 +11,13 @@ mod execute_fp;
 pub mod mmu;
 pub mod icache;
 pub mod jit;
-pub mod run_fast;
+pub mod run_inline_switch;
 
 pub use csr::Csr;
 pub use mmu::Mmu;
 pub use icache::{ICache, CachedInst};
 pub use jit::{BlockCache, BlockResult, execute_block};
-pub use run_fast::run_fast as run_fast_loop;
+pub use run_inline_switch::run_inline_switch as run_inline_switch_loop;
 
 use super::PrivilegeLevel;
 use super::fpu::Fpu;
@@ -61,7 +61,7 @@ pub struct Cpu {
     /// System should clear this after invalidating block cache
     pub cache_invalidation_pending: bool,
 
-    /// Flag set when run_fast encounters an SBI call that needs System handling
+    /// Flag set when run_inline_switch encounters an SBI call that needs System handling
     pub pending_sbi_call: bool,
 
     // Debugging helpers

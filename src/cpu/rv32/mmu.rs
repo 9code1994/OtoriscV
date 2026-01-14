@@ -110,7 +110,7 @@ impl Mmu {
         self.translate_slow(vaddr, access_type, priv_level, bus, satp, mstatus)
     }
 
-    /// Slow path: full page table walk
+    /// Full page table walk
     #[cold]
     fn translate_slow(&mut self, vaddr: u32, access_type: AccessType, priv_level: PrivilegeLevel, bus: &mut impl Bus, satp: u32, mstatus: u32) -> Result<u32, u32> {
         let ppn = satp & 0x3FFFFF;

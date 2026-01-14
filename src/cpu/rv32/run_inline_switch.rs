@@ -5,7 +5,8 @@
 
 use crate::cpu::Cpu;
 use crate::cpu::rv32::mmu::AccessType;
-use crate::cpu::csr::*;
+use crate::cpu::rv32::csr::*;  // Use rv32-specific CSR constants
+use crate::cpu::csr::{MSTATUS_MIE, MSTATUS_SIE};  // Common mstatus bits
 use crate::cpu::trap::Trap;
 use crate::cpu::PrivilegeLevel;
 use crate::memory::{Memory, Bus, DRAM_BASE};
@@ -83,7 +84,7 @@ impl<'a> FastBus<'a> {
 
     #[cold]
     fn read32_device(&mut self, paddr: u32) -> u32 {
-        // Device access - slow path
+        // Device access
         const CLINT_BASE: u32 = 0x0200_0000;
         const UART_BASE: u32 = 0x0300_0000;
         const PLIC_BASE: u32 = 0x0400_0000;
@@ -121,6 +122,9 @@ impl<'a> FastBus<'a> {
         if paddr >= CLINT_BASE && paddr < CLINT_BASE + 0x10000 {
             self.clint.write32(paddr - CLINT_BASE, value);
         } else if paddr >= UART_BASE && paddr < UART_BASE + 0x1000 {
+            if std::env::var("RISCV_DEBUG").is_ok() && paddr == UART_BASE {
+                eprintln!("[FAST UART] write byte={:#04x} ('{}')", value as u8, (value as u8) as char);
+            }
             self.uart.write8(paddr - UART_BASE, value as u8);
         } else if paddr >= PLIC_BASE && paddr < PLIC_BASE + 0x400000 {
             self.plic.write32(paddr - PLIC_BASE, value);
@@ -134,7 +138,13 @@ impl<'a> FastBus<'a> {
         if paddr >= DRAM_BASE {
             self.memory.read8(paddr)
         } else {
-            0 // Device access for bytes is rare
+            // Device byte access - needed for UART LSR reads!
+            const UART_BASE: u32 = 0x0300_0000;
+            if paddr >= UART_BASE && paddr < UART_BASE + 0x1000 {
+                self.uart.read8(paddr - UART_BASE)
+            } else {
+                0
+            }
         }
     }
 
@@ -160,6 +170,9 @@ impl<'a> FastBus<'a> {
     fn write8_device(&mut self, paddr: u32, value: u8) {
         const UART_BASE: u32 = 0x0300_0000;
         if paddr >= UART_BASE && paddr < UART_BASE + 0x1000 {
+            if std::env::var("RISCV_DEBUG").is_ok() && paddr == UART_BASE {
+                eprintln!("[FAST UART8] write byte={:#04x} ('{}')", value, value as char);
+            }
             self.uart.write8(paddr - UART_BASE, value);
         }
     }
@@ -174,7 +187,8 @@ impl<'a> FastBus<'a> {
 
 /// Run the CPU with giant inline switch
 /// Returns number of cycles executed
-pub fn run_fast(
+/// Giant inline switch execution loop (jor1k-style)
+pub fn run_inline_switch(
     cpu: &mut Cpu,
     memory: &mut Memory,
     uart: &mut Uart,
@@ -183,6 +197,9 @@ pub fn run_fast(
     virtio9p: &mut Virtio9p,
     max_cycles: u32,
 ) -> u32 {
+    // Debug flag - set RISCV_DEBUG=1 to enable detailed tracing
+    let debug = std::env::var("RISCV_DEBUG").is_ok();
+    
     // Destructure hot state into locals
     let mut pc = cpu.pc;
     let mut regs = cpu.regs;
@@ -192,8 +209,18 @@ pub fn run_fast(
 
     // Create fast bus
     let mut bus = FastBus { memory, uart, clint, plic, virtio9p };
+    
+    if debug {
+        eprintln!("[DEBUG] Starting run_inline_switch at PC={:#010x}", pc);
+        eprintln!("[DEBUG] Initial registers:");
+        for i in 0..32 {
+            if i % 4 == 0 { eprint!("  "); }
+            eprint!("x{:02}={:#010x} ", i, regs[i]);
+            if i % 4 == 3 { eprintln!(); }
+        }
+    }
 
-    'main: while cycles < max_cycles {
+    while cycles < max_cycles {
         // Batched timer update
         if cycles & (TIMER_BATCH - 1) == 0 {
             bus.clint.tick(TIMER_BATCH as u64);
@@ -202,23 +229,56 @@ pub fn run_fast(
             // Check UART interrupt
             if bus.uart.has_interrupt() {
                 bus.plic.raise_interrupt(10); // UART_IRQ
+            } else {
+                bus.plic.clear_interrupt(10);
             }
             
-            // Check timer interrupt
+            // Check timer interrupt - set both MTIP and STIP
             if bus.clint.timer_interrupt {
-                cpu.csr.mip |= MIP_STIP;
+                cpu.csr.mip |= MIP_MTIP | MIP_STIP;
+                if debug && cycles == 0 {
+                    eprintln!("[DEBUG] Timer interrupt! mip={:#010x} mie={:#010x} mstatus={:#010x} mideleg={:#010x} priv={:?}",
+                        cpu.csr.mip, cpu.csr.mie, cpu.csr.mstatus, cpu.csr.mideleg, cpu.priv_level);
+                }
             } else {
-                cpu.csr.mip &= !MIP_STIP;
+                cpu.csr.mip &= !(MIP_MTIP | MIP_STIP);
+            }
+            
+            // Check software interrupt
+            if bus.clint.software_interrupt {
+                cpu.csr.mip |= MIP_MSIP;
+            } else {
+                cpu.csr.mip &= !MIP_MSIP;
+            }
+            
+            // Check PLIC external interrupts
+            if bus.plic.m_external_interrupt {
+                cpu.csr.mip |= MIP_MEIP;
+            } else {
+                cpu.csr.mip &= !MIP_MEIP;
+            }
+            if bus.plic.s_external_interrupt {
+                cpu.csr.mip |= MIP_SEIP;
+            } else {
+                cpu.csr.mip &= !MIP_SEIP;
             }
             
             // Check for pending interrupts
             if let Some(trap) = cpu.check_interrupts() {
+                if debug {
+                    eprintln!("[DEBUG] Taking interrupt: {:?}", trap);
+                }
                 // Write back and handle
                 cpu.pc = pc;
                 cpu.regs = regs;
                 cpu.handle_trap(trap);
                 pc = cpu.pc;
                 regs = cpu.regs;
+            } else if debug && cycles == 0 && cpu.csr.mip != 0 {
+                // Debug why we're not taking an interrupt even though mip is set
+                let pending = cpu.csr.mip & cpu.csr.mie;
+                eprintln!("[DEBUG] No interrupt taken: mip={:#010x} mie={:#010x} pending={:#010x} mstatus={:#010x}",
+                    cpu.csr.mip, cpu.csr.mie, pending, cpu.csr.mstatus);
             }
         }
 
@@ -266,6 +326,18 @@ pub fn run_fast(
         let rs2_idx = ((inst >> 20) & 0x1F) as usize;
         let funct3 = (inst >> 12) & 0x7;
         let funct7 = (inst >> 25) & 0x7F;
+        
+        // Debug output every 50000 instructions (reduced frequency)
+        if debug && cycles % 50000 == 0 {
+            eprintln!("[{}] PC={:#010x} inst={:#010x} op={:#04x} time={}",
+                cycles, pc, inst, opcode, cpu.csr.time);
+        }
+        
+        // Extra detailed debug for the problematic loop - only first 5 iterations per batch
+        if debug && pc >= 0x80000104 && pc <= 0x8000010c && cycles < 5 {
+            eprintln!("  [DETAIL] Before exec: PC={:#x} inst={:#x} rs1[{}]={:#x} rs2[{}]={:#x}",
+                pc, inst, rs1_idx, regs[rs1_idx], rs2_idx, regs[rs2_idx]);
+        }
 
         // Giant inline switch
         match opcode {
@@ -521,9 +593,20 @@ pub fn run_fast(
 
             // Complex instructions - fallback to step
             OP_SYSTEM | OP_AMO | OP_LOAD_FP | OP_STORE_FP | OP_MADD | OP_MSUB | OP_NMSUB | OP_NMADD | OP_OP_FP => {
-                // Write back state and use slow path
+                // Write back state 
                 cpu.pc = pc;
                 cpu.regs = regs;
+                
+                // CRITICAL: Sync CLINT time before SYSTEM instructions
+                // The kernel reads TIME CSR via RDTIME (csrrs rd, time, x0)
+                // If we don't sync here, time appears frozen and calibration loops hang
+                bus.clint.tick(0); // Just sync, don't advance
+                cpu.csr.time = bus.clint.get_mtime();
+                
+                if debug && opcode == OP_SYSTEM {
+                    eprintln!("  [OP_SYSTEM] PC={:#010x} inst={:#010x} rd={} funct3={} imm={:#x}", 
+                        pc, inst, rd, funct3, (inst >> 20));
+                }
                 
                 let result = cpu.step(&mut SystemBusAdapter(&mut bus));
                 
@@ -531,6 +614,9 @@ pub fn run_fast(
                 regs = cpu.regs;
                 
                 if let Err(trap) = result {
+                    if debug {
+                        eprintln!("  [TRAP] {:?} at PC={:#010x}", trap, pc);
+                    }
                     // Check for SBI call - handle common ones inline
                     if matches!(trap, Trap::EnvironmentCallFromS) {
                         // Handle SBI calls inline for speed
@@ -538,11 +624,20 @@ pub fn run_fast(
                         let a0 = regs[10];
                         let a1 = regs[11];
                         
+                        if debug && eid != 1 { // Don't spam on putchar
+                            eprintln!("  [SBI] eid={:#x} fid={} a0={:#x} a1={:#x} time={}", 
+                                eid, regs[16], a0, a1, cpu.csr.time);
+                        }
+                        
                         let (error, value) = match eid {
                             0 => { // SBI_EXT_LEGACY_SET_TIMER
                                 bus.clint.write32(0x4000, a0);      // mtimecmp low
                                 bus.clint.write32(0x4004, a1);      // mtimecmp high
                                 cpu.csr.mip &= !MIP_STIP;            // Clear pending timer
+                                if debug {
+                                    eprintln!("    [TIMER] Set mtimecmp to {:#x}:{:#x}, cleared STIP",
+                                        a1, a0);
+                                }
                                 (0u32, 0u32)
                             }
                             1 => { // SBI_EXT_LEGACY_CONSOLE_PUTCHAR
@@ -552,8 +647,40 @@ pub fn run_fast(
                             2 => { // SBI_EXT_LEGACY_CONSOLE_GETCHAR
                                 ((-1i32) as u32, 0u32)
                             }
+                            0x54494D45 => { // SBI_EXT_TIME ("TIME")
+                                // Modern TIME extension set_timer (fid=0)
+                                bus.clint.write32(0x4000, a0);      // mtimecmp low
+                                bus.clint.write32(0x4004, a1);      // mtimecmp high
+                                cpu.csr.mip &= !MIP_STIP;            // Clear pending timer
+                                if debug {
+                                    eprintln!("    [TIME ext] Set mtimecmp to {:#x}:{:#x}, cleared STIP",
+                                        a1, a0);
+                                }
+                                (0u32, 0u32)
+                            }
+                            0x10 => { // SBI_EXT_BASE - probe extension etc
+                                let fid = regs[16];
+                                match fid {
+                                    0 => (0u32, 0x00000002u32),  // get_spec_version: SBI 0.2
+                                    1 => (0u32, 0u32),           // get_impl_id: 0 = BBL
+                                    2 => (0u32, 0u32),           // get_impl_version
+                                    3 => {                        // probe_extension
+                                        let probe_eid = a0;
+                                        let available = match probe_eid {
+                                            0 | 1 | 2 | 0x10 | 0x54494D45 => 1,
+                                            _ => 0,
+                                        };
+                                        (0u32, available)
+                                    }
+                                    4 | 5 | 6 => (0u32, 0u32),   // vendorid, marchid, mimpid
+                                    _ => ((-2i32) as u32, 0u32), // SBI_ERR_NOT_SUPPORTED
+                                }
+                            }
                             _ => {
                                 // Unknown SBI - return to System to handle
+                                if debug {
+                                    eprintln!("  [SBI] Unknown extension {:#x}, returning to System (fid={})", eid, regs[16]);
+                                }
                                 cpu.pc = pc;
                                 cpu.regs = regs;
                                 cycles += 1;
@@ -598,6 +725,11 @@ pub fn run_fast(
 
     // Process VirtIO queues
     bus.virtio9p.process_queues(bus.memory);
+    
+    if debug {
+        eprintln!("[DEBUG] run_inline_switch exiting: executed {} cycles, PC now at {:#010x}", cycles, pc);
+        eprintln!("  Final sp={:#010x} ra={:#010x}", regs[2], regs[1]);
+    }
 
     cycles
 }

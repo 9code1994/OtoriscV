@@ -4,7 +4,7 @@
 
 use crate::cpu::Cpu;
 use crate::cpu::csr::*;
-use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType, run_fast_loop};
+use crate::cpu::rv32::{BlockCache, BlockResult, execute_block, mmu::AccessType, run_inline_switch_loop};
 use crate::cpu::rv32::jit::{JitState, RegionResult, execute_region, HEAT_PER_BLOCK, Page};
 use crate::memory::{Memory, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
@@ -88,7 +88,7 @@ impl System {
             virtio9p: Virtio9p::new("rootfs", fs_backend),
             block_cache: BlockCache::new(),
             jit_state: JitState::new(),
-            use_jit_v2: false, // Default to v1 for backward compatibility
+            use_jit_v2: false,  // JIT v2 has bugs, use v1 by default
         })
     }
     
@@ -188,6 +188,7 @@ impl System {
     /// Returns the number of cycles actually executed
     pub fn run(&mut self, max_cycles: u32) -> u32 {
         let mut cycles = 0u32;
+        let debug = std::env::var("RISCV_DEBUG").is_ok();
         
         // Batch size for timer updates (jor1k uses 64)
         const TIMER_BATCH: u32 = 64;
@@ -248,8 +249,16 @@ impl System {
                 Err(trap) => {
                     // Handle SBI calls from S-mode directly in Rust
                     if let crate::cpu::trap::Trap::EnvironmentCallFromS = trap {
+                        if debug {
+                            let eid = self.cpu.regs[17];
+                            let a0 = self.cpu.regs[10];
+                            eprintln!("[SBI] eid={:#x} a0={:#x} PC={:#010x}", eid, a0, self.cpu.pc);
+                        }
                         self.handle_sbi_call();
                     } else {
+                        if debug {
+                            eprintln!("[TRAP] {:?} at PC={:#010x}", trap, self.cpu.pc);
+                        }
                         self.cpu.handle_trap(trap);
                     }
                     cycles += 1;
@@ -261,14 +270,35 @@ impl System {
         cycles
     }
     
-    /// Run with giant inline switch for maximum performance
-    /// Falls back to slow path for FP and complex instructions
-    pub fn run_fast(&mut self, max_cycles: u32) -> u32 {
+    /// Run with giant inline switch (jor1k-style direct interpretation)
+    /// With JIT v2 integration: checks for hot compiled regions before inline switch
+    pub fn run_inline_switch(&mut self, max_cycles: u32) -> u32 {
         let mut total_cycles = 0u32;
         let mut remaining = max_cycles;
         
         while remaining > 0 {
-            let cycles = run_fast_loop(
+            // Check cache invalidation request
+            if self.cpu.cache_invalidation_pending {
+                self.jit_state.invalidate_all();
+                self.cpu.cache_invalidation_pending = false;
+            }
+            
+            // UGLY JIT v2 integration: Try JIT execution first if available
+            if self.use_jit_v2 {
+                if let Some(jit_cycles) = self.try_jit_execution() {
+                    total_cycles += jit_cycles;
+                    remaining = remaining.saturating_sub(jit_cycles);
+                    
+                    // Handle pending SBI call from JIT
+                    if self.cpu.pending_sbi_call {
+                        self.cpu.pending_sbi_call = false;
+                        self.handle_sbi_call();
+                    }
+                    continue;
+                }
+            }
+            
+            let cycles = run_inline_switch_loop(
                 &mut self.cpu,
                 &mut self.memory,
                 &mut self.uart,
@@ -295,6 +325,78 @@ impl System {
         }
         
         total_cycles
+    }
+    
+    /// Try to execute using JIT v2 compiled region
+    /// Returns Some(cycles) if JIT execution happened, None if no JIT region available
+    fn try_jit_execution(&mut self) -> Option<u32> {
+        // Translate PC to physical address
+        let satp = self.cpu.csr.satp;
+        let mstatus = self.cpu.csr.mstatus;
+        let priv_level = self.cpu.priv_level;
+        
+        // Create bus for translation and execution
+        let mut bus = SystemBus::new(
+            &mut self.memory,
+            &mut self.uart,
+            &mut self.clint,
+            &mut self.plic,
+            &mut self.virtio9p,
+        );
+        
+        let paddr = match self.cpu.mmu.translate(
+            self.cpu.pc, 
+            AccessType::Instruction, 
+            priv_level, 
+            &mut bus, 
+            satp, 
+            mstatus
+        ) {
+            Ok(pa) => pa,
+            Err(_) => return None, // Let inline switch handle the page fault
+        };
+        
+        // Record execution for hotness tracking
+        let page = Page::of(paddr);
+        if let Some(hot_page) = self.jit_state.record_execution(paddr, HEAT_PER_BLOCK) {
+            // Page became hot - compile the region
+            self.jit_state.compile_region(&mut bus, hot_page);
+        }
+        
+        // Try to execute using compiled region
+        if let Some(region) = self.jit_state.get_region(page) {
+            // Execute the compiled region
+            match execute_region(&mut self.cpu, &mut bus, region) {
+                RegionResult::Continue(next_pc) => {
+                    self.cpu.pc = next_pc;
+                    let inst_count = region.blocks.values()
+                        .map(|b| b.instructions.len())
+                        .sum::<usize>() as u32;
+                    let inst_count = inst_count.max(1);
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count += inst_count as u64;
+                    self.cpu.csr.cycle = self.cpu.csr.cycle.wrapping_add(inst_count as u64);
+                    return Some(inst_count);
+                }
+                RegionResult::Exit(next_pc) => {
+                    self.cpu.pc = next_pc;
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count += 1;
+                    self.cpu.csr.cycle = self.cpu.csr.cycle.wrapping_add(1);
+                    return Some(1);
+                }
+                RegionResult::Trap(trap) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.handle_trap(trap);
+                    return Some(1);
+                }
+            }
+        }
+        
+        None // No JIT region, fall back to inline switch
     }
     
     /// Execute a basic block, returning number of instructions executed
