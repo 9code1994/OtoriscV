@@ -132,38 +132,29 @@ fn execute_structure(
 /// 
 /// All blocks are keyed by PHYSICAL address (PA).
 /// `start_paddr` is the physical address corresponding to current cpu.pc.
+/// 
+/// Key insight: Within a page, VA and PA share the same offset (lower 12 bits).
+/// For now, execute only one block and return - let caller handle next translation.
 pub fn execute_region(
     cpu: &mut Cpu,
     bus: &mut impl Bus,
     region: &CompiledRegion,
     start_paddr: u32,
 ) -> RegionResult {
-    let page = if let Some(&first_entry) = region.entry_points.first() {
-        Page::of(first_entry)
-    } else {
-        return RegionResult::Exit(cpu.pc);
+    // Check if we have a block at this PA
+    let block = match region.blocks.get(&start_paddr) {
+        Some(b) => b,
+        None => return RegionResult::Exit(cpu.pc),
     };
     
-    // Use physical address for block lookup
-    let paddr = start_paddr;
-    if !region.blocks.contains_key(&paddr) {
-        return RegionResult::Exit(cpu.pc);
-    }
-    
-    // Execute starting from current block (keyed by PA)
-    if let Some(block) = region.blocks.get(&paddr) {
-        match execute_basic_block(cpu, bus, block) {
-            Ok(next_pc) => {
-                cpu.pc = next_pc;
-                // For next iteration, we'd need to translate again
-                // But for now, just exit and let caller translate next VA
-                // This is simpler and avoids complexity of inline translation
-                return RegionResult::Exit(next_pc);
-            }
-            Err(trap) => return RegionResult::Trap(trap),
+    // Execute the single block
+    match execute_basic_block(cpu, bus, block) {
+        Ok(_) => {
+            // Return Continue with new PC (set by execute_cached)
+            RegionResult::Continue(cpu.pc)
         }
+        Err(trap) => RegionResult::Trap(trap),
     }
-    RegionResult::Exit(cpu.pc)
 }
 
 /// Simple linear execution fallback (used when structure is empty)

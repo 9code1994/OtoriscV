@@ -447,16 +447,14 @@ impl System {
     
     /// Execute using JIT v2 (page-based with CFG optimization)
     /// 
-    /// NOTE: JIT v2 CFG execution is currently disabled due to VA/PA translation
-    /// issues in branch target computation. Falls back to v1 block execution
-    /// which correctly handles VA→PA translation.
+    /// NOTE: CFG-based execution has unresolved bugs causing hangs.
+    /// Falls back to v1 block execution for correctness.
     fn step_block_v2(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
-        // JIT v2's CFG-based execution has fundamental issues:
-        // - Branch targets are computed from PA but offsets are VA-relative
-        // - This causes wrong target addresses for cross-page branches
+        // JIT v2 CFG execution causes hangs at specific points during Linux boot
+        // Root cause unclear - may be related to block execution order or 
+        // PA/VA handling in multi-block execution.
         // 
-        // For now, just use v1's proven PA-based block execution.
-        // The v2 hotness tracking can be added later once CFG is fixed.
+        // For now, use v1's proven single-block execution.
         self.step_block_v1()
     }
     
