@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OtoRISCV Mini Shell</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #21262d 100%);
+            min-height: 100vh;
+            color: #c9d1d9;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, #58a6ff, #a371f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: #8b949e;
+            font-size: 0.95rem;
+        }
+
+        .status-bar {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #f85149;
+        }
+
+        .status-dot.running {
+            background: #3fb950;
+            animation: pulse 1s infinite;
+        }
+
+        .status-dot.booting {
+            background: #d29922;
+            animation: pulse 0.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .terminal-container {
+            width: 100%;
+            max-width: 900px;
+            background: #0d1117;
+            border-radius: 12px;
+            border: 1px solid #30363d;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+
+        .terminal-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+        }
+
+        .terminal-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        .terminal-dot.red { background: #ff5f56; }
+        .terminal-dot.yellow { background: #ffbd2e; }
+        .terminal-dot.green { background: #27c93f; }
+
+        .terminal-title {
+            margin-left: 10px;
+            font-size: 0.85rem;
+            color: #8b949e;
+        }
+
+        #terminal {
+            padding: 10px;
+            height: 500px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        button {
+            padding: 10px 24px;
+            font-size: 0.95rem;
+            font-weight: 500;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: #238636;
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #2ea043;
+        }
+        .btn-primary:disabled {
+            background: #21262d;
+            color: #484f58;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: #21262d;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+        }
+        .btn-secondary:hover {
+            background: #30363d;
+        }
+
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(13, 17, 23, 0.95);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top-color: #58a6ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        #loading-text {
+            margin-top: 20px;
+            font-size: 1rem;
+            color: #8b949e;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .info-box {
+            margin-top: 20px;
+            padding: 15px 20px;
+            background: rgba(56, 139, 253, 0.1);
+            border: 1px solid rgba(56, 139, 253, 0.4);
+            border-radius: 8px;
+            max-width: 900px;
+            font-size: 0.9rem;
+            color: #8b949e;
+        }
+
+        .info-box code {
+            background: rgba(110, 118, 129, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'JetBrains Mono', monospace;
+            color: #c9d1d9;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+        <div id="loading-text">Loading OtoRISCV...</div>
+    </div>
+
+    <header>
+        <h1>🖥️ OtoRISCV Mini Shell</h1>
+        <p class="subtitle">Linux 6.6.70 running on RISC-V 32-bit emulator in WebAssembly</p>
+    </header>
+
+    <div class="status-bar">
+        <div class="status-item">
+            <div class="status-dot" id="status-dot"></div>
+            <span id="status-text">Stopped</span>
+        </div>
+        <div class="status-item">
+            <span id="ips-display">0 IPS</span>
+        </div>
+        <div class="status-item">
+            <span id="boot-progress">Ready</span>
+        </div>
+    </div>
+
+    <div class="terminal-container">
+        <div class="terminal-header">
+            <div class="terminal-dot red"></div>
+            <div class="terminal-dot yellow"></div>
+            <div class="terminal-dot green"></div>
+            <span class="terminal-title">OtoRISCV Terminal — Linux rv32ima</span>
+        </div>
+        <div id="terminal"></div>
+    </div>
+
+    <div class="controls">
+        <button id="btn-boot" class="btn-primary">🚀 Boot Linux</button>
+        <button id="btn-stop" class="btn-secondary">⏹ Stop</button>
+        <button id="btn-reset" class="btn-secondary">🔄 Reset</button>
+    </div>
+
+    <div class="info-box">
+        <strong>Shell Commands:</strong> 
+        <code>help</code> <code>ls</code> <code>cd</code> <code>pwd</code> 
+        <code>cat</code> <code>touch</code> <code>mkdir</code> <code>mount</code> 
+        <code>uname</code> <code>echo</code>
+        <br><br>
+        <strong>Tip:</strong> After boot, try <code>ls /proc</code> or <code>cat /proc/cpuinfo</code>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script type="module">
+        import init, { Emulator } from './pkg/otoriscv.js';
+
+        let emulator = null;
+        let running = false;
+        let animationId = null;
+        let terminal = null;
+        let booted = false;
+        let lastInstrCount = 0n;
+        let lastTime = performance.now();
+
+        // Initialize xterm.js
+        function initTerminal() {
+            terminal = new Terminal({
+                theme: {
+                    background: '#0d1117',
+                    foreground: '#c9d1d9',
+                    cursor: '#58a6ff',
+                    cursorAccent: '#0d1117',
+                    selection: 'rgba(56, 139, 253, 0.3)',
+                },
+                fontFamily: 'JetBrains Mono, Menlo, Consolas, monospace',
+                fontSize: 14,
+                cursorBlink: true,
+                cols: 100,
+                rows: 28,
+                scrollback: 5000,
+            });
+
+            terminal.open(document.getElementById('terminal'));
+            terminal.writeln('\x1b[1;34m╔═══════════════════════════════════════════════════════════════╗');
+            terminal.writeln('║          OtoRISCV - RISC-V Emulator in WebAssembly             ║');
+            terminal.writeln('╚═══════════════════════════════════════════════════════════════╝\x1b[0m');
+            terminal.writeln('');
+            terminal.writeln('Click "Boot Linux" to start the emulator...');
+            terminal.writeln('');
+
+            // Handle keyboard input
+            terminal.onData(data => {
+                if (emulator && running) {
+                    for (let i = 0; i < data.length; i++) {
+                        let c = data.charCodeAt(i);
+                        // Convert CR to LF
+                        if (c === 13) c = 10;
+                        emulator.send_char(c);
+                    }
+                }
+            });
+        }
+
+        // Format numbers with K/M/G suffixes
+        function formatNumber(n) {
+            if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G';
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return Math.round(n).toString();
+        }
+
+        // Load kernel and initrd
+        async function loadImages() {
+            document.getElementById('boot-progress').textContent = 'Loading kernel...';
+            
+            const kernelResp = await fetch('../images/Image-minimal');
+            if (!kernelResp.ok) throw new Error('Failed to load kernel');
+            const kernelData = new Uint8Array(await kernelResp.arrayBuffer());
+            
+            document.getElementById('boot-progress').textContent = 'Loading initrd...';
+            
+            const initrdResp = await fetch('../images/minifs.cpio.gz');
+            if (!initrdResp.ok) throw new Error('Failed to load initrd');
+            const initrdData = new Uint8Array(await initrdResp.arrayBuffer());
+            
+            return { kernel: kernelData, initrd: initrdData };
+        }
+
+        // Main emulation loop
+        function runLoop() {
+            if (!running || !emulator) return;
+
+            // Run cycles
+            const cycles = emulator.run(50000);
+
+            // Get UART output
+            const output = emulator.get_uart_output();
+            if (output.length > 0) {
+                const text = new TextDecoder().decode(output);
+                terminal.write(text);
+                
+                // Check if boot is complete
+                if (!booted && text.includes('# ')) {
+                    booted = true;
+                    document.getElementById('status-dot').classList.remove('booting');
+                    document.getElementById('status-dot').classList.add('running');
+                    document.getElementById('boot-progress').textContent = 'Shell ready!';
+                }
+            }
+
+            // Update stats every 200ms
+            const currentTime = performance.now();
+            const elapsed = currentTime - lastTime;
+            if (elapsed > 200) {
+                const instrCount = BigInt(emulator.get_ips());
+                const diff = instrCount - lastInstrCount;
+                const ips = Number(diff) / (elapsed / 1000);
+
+                document.getElementById('ips-display').textContent = formatNumber(ips) + ' IPS';
+                lastInstrCount = instrCount;
+                lastTime = currentTime;
+            }
+
+            animationId = requestAnimationFrame(runLoop);
+        }
+
+        // Initialize WASM
+        async function initWasm() {
+            try {
+                await init();
+                emulator = new Emulator(128); // 128MB RAM for Linux
+
+                document.getElementById('loading-overlay').classList.add('hidden');
+                terminal.writeln('\x1b[32m✓ WebAssembly module loaded\x1b[0m');
+                terminal.writeln('');
+            } catch (e) {
+                document.getElementById('loading-text').textContent = 'Failed to load: ' + e.message;
+                console.error('Failed to initialize WASM:', e);
+            }
+        }
+
+        // Boot button handler
+        document.getElementById('btn-boot').addEventListener('click', async () => {
+            if (!emulator || running) return;
+            
+            const btn = document.getElementById('btn-boot');
+            btn.disabled = true;
+            btn.textContent = '⏳ Booting...';
+            
+            try {
+                terminal.writeln('\x1b[33mLoading Linux kernel and initramfs...\x1b[0m');
+                
+                const { kernel, initrd } = await loadImages();
+                
+                terminal.writeln(`\x1b[32m✓ Kernel: ${formatNumber(kernel.length)}B\x1b[0m`);
+                terminal.writeln(`\x1b[32m✓ Initrd: ${formatNumber(initrd.length)}B\x1b[0m`);
+                terminal.writeln('');
+                terminal.writeln('\x1b[33mBooting Linux... (this takes ~30-60 seconds)\x1b[0m');
+                terminal.writeln('');
+                
+                // Setup Linux boot with initrd
+                const cmdline = 'lpj=10000 console=ttyS0 earlycon rdinit=/sbin/init';
+                emulator.setup_linux_with_initrd(kernel, initrd, cmdline);
+                
+                // Start emulation
+                running = true;
+                booted = false;
+                document.getElementById('status-dot').classList.add('booting');
+                document.getElementById('status-text').textContent = 'Booting';
+                document.getElementById('boot-progress').textContent = 'Booting kernel...';
+                
+                lastTime = performance.now();
+                lastInstrCount = BigInt(emulator.get_ips());
+                runLoop();
+                
+                btn.textContent = '🚀 Running';
+            } catch (e) {
+                terminal.writeln(`\x1b[31m✗ Boot failed: ${e}\x1b[0m`);
+                btn.disabled = false;
+                btn.textContent = '🚀 Boot Linux';
+                console.error('Boot failed:', e);
+            }
+        });
+
+        // Stop button
+        document.getElementById('btn-stop').addEventListener('click', () => {
+            running = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+            document.getElementById('status-dot').classList.remove('running', 'booting');
+            document.getElementById('status-text').textContent = 'Stopped';
+            document.getElementById('btn-boot').disabled = false;
+            document.getElementById('btn-boot').textContent = '🚀 Boot Linux';
+        });
+
+        // Reset button
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            running = false;
+            booted = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+            if (emulator) {
+                emulator.reset();
+            }
+            document.getElementById('status-dot').classList.remove('running', 'booting');
+            document.getElementById('status-text').textContent = 'Reset';
+            document.getElementById('boot-progress').textContent = 'Ready';
+            document.getElementById('btn-boot').disabled = false;
+            document.getElementById('btn-boot').textContent = '🚀 Boot Linux';
+            terminal.clear();
+            terminal.writeln('\x1b[33mEmulator reset\x1b[0m');
+            terminal.writeln('');
+            terminal.writeln('Click "Boot Linux" to start again...');
+        });
+
+        // Initialize
+        initTerminal();
+        initWasm();
+    </script>
+</body>
+</html>

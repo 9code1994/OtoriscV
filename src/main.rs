@@ -1,6 +1,9 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write, stdout};
+use std::path::Path;
+use flate2::read::GzDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 use std::time::{Duration, Instant};
 
 // Use the library crate's modules
@@ -212,7 +215,7 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     
-    println!("OtoRISCV CLI");
+    println!("OtoriscV CLI");
     println!("Loading kernel: {}", kernel_path);
     if !initrd_path.is_empty() {
         println!("Loading initrd: {}", initrd_path);
@@ -231,17 +234,46 @@ fn main() -> io::Result<()> {
         system.enable_jit_v2(true);
     }
     
-    // Read kernel file
-    let mut f = File::open(&kernel_path)?;
-    let mut kernel_data = Vec::new();
-    f.read_to_end(&mut kernel_data)?;
-    
-    // Read initrd if provided
-    let initrd_data = if !initrd_path.is_empty() {
-        let mut f = File::open(&initrd_path)?;
+    // Helper function to load and decompress files
+    fn load_file_with_decompression(path: &str) -> io::Result<Vec<u8>> {
+        let file = File::open(path)?;
+        let path_obj = Path::new(path);
         let mut data = Vec::new();
-        f.read_to_end(&mut data)?;
-        Some(data)
+        
+        // Detect file type by extension
+        if let Some(ext) = path_obj.extension() {
+            match ext.to_str() {
+                Some("gz") => {
+                    // Gzip decompression
+                    let mut decoder = GzDecoder::new(file);
+                    decoder.read_to_end(&mut data)?;
+                }
+                Some("zst") => {
+                    // Zstd decompression
+                    let mut decoder = ZstdDecoder::new(file)?;
+                    decoder.read_to_end(&mut data)?;
+                }
+                _ => {
+                    // Raw file
+                    let mut f = file;
+                    f.read_to_end(&mut data)?;
+                }
+            }
+        } else {
+            // No extension, assume raw
+            let mut f = file;
+            f.read_to_end(&mut data)?;
+        }
+        
+        Ok(data)
+    }
+    
+    // Read kernel file (with automatic decompression)
+    let kernel_data = load_file_with_decompression(&kernel_path)?;
+    
+    // Read initrd if provided (with automatic decompression)
+    let initrd_data = if !initrd_path.is_empty() {
+        Some(load_file_with_decompression(&initrd_path)?)
     } else {
         None
     };

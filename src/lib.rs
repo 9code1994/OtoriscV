@@ -175,6 +175,37 @@ impl Emulator {
     }
 }
 
+/// Decompress zstd-compressed data
+/// Useful for loading compressed kernel images in the browser
+#[wasm_bindgen]
+pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, JsValue> {
+    zstd::stream::decode_all(data)
+        .map_err(|e| JsValue::from_str(&format!("Zstd decompression error: {}", e)))
+}
+
+/// Decompress gzip-compressed data (if flate2 is available)
+/// Useful for loading compressed kernel images in the browser
+#[wasm_bindgen]
+pub fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, JsValue> {
+    use std::io::Read;
+    
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use flate2::read::GzDecoder;
+        let mut decoder = GzDecoder::new(data);
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result)
+            .map_err(|e| JsValue::from_str(&format!("Gzip decompression error: {}", e)))?;
+        Ok(result)
+    }
+    
+    #[cfg(target_arch = "wasm32")]
+    {
+        // For WASM, use a pure Rust gzip implementation
+        Err(JsValue::from_str("Gzip decompression not yet implemented for WASM. Use zstd instead or decompress in JavaScript."))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

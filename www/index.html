@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OtoRISCV Emulator</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #e4e4e7;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding: 15px 25px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        h1::before {
+            content: '🔧';
+            font-size: 1.5rem;
+        }
+
+        .status-bar {
+            display: flex;
+            gap: 20px;
+            font-size: 0.9rem;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ef4444;
+        }
+
+        .status-dot.running {
+            background: #22c55e;
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .main-panel {
+            display: grid;
+            grid-template-columns: 1fr 300px 300px;
+            gap: 20px;
+        }
+
+        .terminal-container {
+            background: rgba(0, 0, 0, 0.6);
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .terminal-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .terminal-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .terminal-dot.red {
+            background: #ef4444;
+        }
+
+        .terminal-dot.yellow {
+            background: #eab308;
+        }
+
+        .terminal-dot.green {
+            background: #22c55e;
+        }
+
+        #terminal {
+            height: 500px;
+            flex-grow: 1;
+        }
+
+        .control-panel,
+        .debug-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .panel-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .panel-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: #a1a1aa;
+            margin-bottom: 15px;
+            position: sticky;
+            top: 0;
+            background: rgba(26, 26, 46, 0.95);
+            padding: 5px 0;
+            z-index: 10;
+        }
+
+        .button-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        button {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px -5px rgba(59, 130, 246, 0.4);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: #e4e4e7;
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: white;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .stat-item {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 12px;
+            border-radius: 10px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: #60a5fa;
+            word-break: break-all;
+            font-family: monospace;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: #a1a1aa;
+            margin-top: 4px;
+        }
+
+        .reg-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+
+        .reg-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 8px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+        }
+
+        .reg-name {
+            color: #a78bfa;
+            font-weight: bold;
+        }
+
+        .reg-val {
+            color: #e4e4e7;
+        }
+
+        .reg-val.changed {
+            color: #fca5a5;
+        }
+
+        .stack-list {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .stack-row {
+            display: flex;
+            gap: 10px;
+            padding: 4px 8px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+        }
+
+        .stack-addr {
+            color: #60a5fa;
+        }
+
+        .stack-val {
+            color: #34d399;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+        }
+
+        .file-input-wrapper input[type="file"] {
+            display: none;
+        }
+
+        .file-label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px dashed rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .file-label:hover {
+            border-color: #60a5fa;
+            background: rgba(96, 165, 250, 0.1);
+        }
+
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(26, 26, 46, 0.95);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .spinner {
+            width: 60px;
+            height: 60px;
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        #loading-text {
+            margin-top: 20px;
+            font-size: 1.1rem;
+            color: #a1a1aa;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* Checkbox for refresh rate */
+        .refresh-control {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.8rem;
+            color: #a1a1aa;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+        <div id="loading-text">Loading OtoRISCV Emulator...</div>
+    </div>
+
+    <div class="container">
+        <header>
+            <h1>OtoRISCV Emulator</h1>
+            <div class="status-bar">
+                <div class="status-item">
+                    <div class="status-dot" id="status-dot"></div>
+                    <span id="status-text">Stopped</span>
+                </div>
+                <div class="status-item">
+                    <span id="ips-display">0 IPS</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="main-panel">
+            <div class="terminal-container">
+                <div class="terminal-header">
+                    <div class="terminal-dot red"></div>
+                    <div class="terminal-dot yellow"></div>
+                    <div class="terminal-dot green"></div>
+                    <span style="margin-left: 10px; color: #a1a1aa;">Terminal</span>
+                </div>
+                <div id="terminal"></div>
+            </div>
+
+            <!-- Center Panel: Controls & File -->
+            <div class="control-panel">
+                <div class="panel-section">
+                    <div class="panel-title">Controls</div>
+                    <div class="button-group">
+                        <button class="btn-primary" id="btn-start">
+                            ▶️ Start
+                        </button>
+                        <button class="btn-secondary" id="btn-stop">
+                            ⏹️ Stop
+                        </button>
+                        <button class="btn-danger" id="btn-reset">
+                            🔄 Reset
+                        </button>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="panel-title">Load Kernel</div>
+                    <div class="file-input-wrapper">
+                        <input type="file" id="kernel-file" accept=".bin,.img">
+                        <label class="file-label" for="kernel-file">
+                            📁 Select Kernel Binary
+                        </label>
+                    </div>
+                    <div id="kernel-name" style="margin-top: 10px; font-size: 0.85rem; color: #a1a1aa;">
+                        No kernel loaded
+                    </div>
+
+                    <div style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
+                        <div class="refresh-control" style="margin-bottom: 10px;">
+                            <input type="checkbox" id="linux-mode">
+                            <label for="linux-mode">Linux Boot Mode</label>
+                        </div>
+                        <div id="linux-opts" class="hidden">
+                            <div style="font-size: 0.8rem; color: #a1a1aa; margin-bottom: 4px;">Command Line:</div>
+                            <input type="text" id="linux-cmdline" value="console=ttyS0 root=/dev/vda ro"
+                                style="width: 100%; padding: 8px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); color: #e4e4e7; border-radius: 4px;">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="panel-title">Statistics</div>
+                    <div class="stats-grid">
+                        <div class="stat-item" style="grid-column: span 2">
+                            <div class="stat-value" id="stat-instr">0</div>
+                            <div class="stat-label">Instructions</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Debugger -->
+            <div class="debug-panel">
+                <div class="panel-section">
+                    <div class="panel-title">
+                        Registers
+                        <div class="refresh-control">
+                            <input type="checkbox" id="live-refresh" checked>
+                            <label for="live-refresh">Live Update</label>
+                        </div>
+                    </div>
+                    <div class="reg-grid" id="reg-grid">
+                        <!-- Registers injected here -->
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="panel-title">Stack (SP-based)</div>
+                    <div class="stack-list" id="stack-view">
+                        <div class="stack-row">
+                            <span class="stack-addr">...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script type="module">
+        // WASM module import
+        import init, { Emulator } from './pkg/otoriscv.js';
+
+        let emulator = null;
+        let running = false;
+        let animationId = null;
+        let terminal = null;
+        let lastInstrCount = 0n;
+        let lastTime = performance.now();
+
+        // Register names
+        const REG_NAMES = [
+            "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+            "s0/fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+            "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+            "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"
+        ];
+
+        let prevRegs = new Array(33).fill(0); // 32 regs + PC
+
+        // Initialize xterm.js
+        function initTerminal() {
+            terminal = new Terminal({
+                theme: {
+                    background: 'transparent',
+                    foreground: '#e4e4e7',
+                    cursor: '#60a5fa',
+                    cursorAccent: '#1a1a2e',
+                },
+                fontFamily: 'JetBrains Mono, Menlo, monospace',
+                fontSize: 14,
+                cursorBlink: true,
+                cols: 80,
+                rows: 24,
+            });
+
+            terminal.open(document.getElementById('terminal'));
+            terminal.writeln('\x1b[1;34m╔════════════════════════════════════════════════╗');
+            terminal.writeln('║     RISC-V Emulator - Ready                    ║');
+            terminal.writeln('╚════════════════════════════════════════════════╝\x1b[0m');
+            terminal.writeln('');
+            terminal.writeln('Load a kernel binary to begin...');
+
+            // Handle keyboard input
+            terminal.onData(data => {
+                if (emulator && running) {
+                    for (let i = 0; i < data.length; i++) {
+                        emulator.send_char(data.charCodeAt(i));
+                    }
+                }
+            });
+        }
+
+        function initRegisters() {
+            const grid = document.getElementById('reg-grid');
+            grid.innerHTML = '';
+
+            // PC Special
+            const pcRow = document.createElement('div');
+            pcRow.className = 'reg-row';
+            pcRow.innerHTML = `<span class="reg-name">pc</span><span class="reg-val" id="reg-pc">0x00000000</span>`;
+            grid.appendChild(pcRow);
+
+            REG_NAMES.forEach((name, i) => {
+                const row = document.createElement('div');
+                row.className = 'reg-row';
+                row.innerHTML = `<span class="reg-name">${name}</span><span class="reg-val" id="reg-${i}">0x00000000</span>`;
+                grid.appendChild(row);
+            });
+        }
+
+        function updateDebugView() {
+            if (!document.getElementById('live-refresh').checked) return;
+
+            const pc = emulator.get_pc();
+            const regs = emulator.get_registers(); // Returns Uint32Array from WASM
+
+            // Update PC
+            const pcEl = document.getElementById('reg-pc');
+            pcEl.textContent = '0x' + pc.toString(16).padStart(8, '0');
+            if (pc !== prevRegs[32]) {
+                pcEl.classList.add('changed');
+                setTimeout(() => pcEl.classList.remove('changed'), 500);
+            }
+            prevRegs[32] = pc;
+
+            // Update Registers
+            for (let i = 0; i < 32; i++) {
+                const val = regs[i];
+                const el = document.getElementById(`reg-${i}`);
+                el.textContent = '0x' + val.toString(16).padStart(8, '0');
+
+                if (val !== prevRegs[i]) {
+                    el.classList.add('changed');
+                    setTimeout(() => el.classList.remove('changed'), 500);
+                }
+                prevRegs[i] = val;
+            }
+
+            // Update Stack (SP based)
+            let sp = regs[2]; // x2 is sp
+            const stackView = document.getElementById('stack-view');
+
+            // Only read stack if sp looks valid (in RAM)
+            if (sp >= 0x80000000) {
+                // Align to 4 bytes
+                sp = sp & (~3);
+                // Read 10 words before/at SP
+                // Since stack grows down, we want to see higher addresses too? 
+                // Usually we care about what's AT sp and above (pushed items)
+                const bytes = emulator.read_memory(sp, 64); // read 64 bytes
+
+                let html = '';
+                for (let i = 0; i < bytes.length; i += 4) {
+                    const addr = sp + i;
+                    // Little endian combine
+                    const val = (bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24)) >>> 0;
+                    html += `
+                        <div class="stack-row">
+                            <span class="stack-addr">0x${addr.toString(16)}:</span>
+                            <span class="stack-val">0x${val.toString(16).padStart(8, '0')}</span>
+                        </div>
+                     `;
+                }
+                stackView.innerHTML = html;
+            } else {
+                stackView.innerHTML = '<div class="stack-row"><span class="stack-addr">SP Invalid</span></div>';
+            }
+        }
+
+        // Initialize WASM
+        async function initWasm() {
+            try {
+                await init();
+                emulator = new Emulator(64); // 64MB RAM
+
+                document.getElementById('loading-overlay').classList.add('hidden');
+                terminal.writeln('\x1b[32m✓ WASM module loaded\x1b[0m');
+
+                updateDebugView();
+            } catch (e) {
+                document.getElementById('loading-text').textContent = 'Failed to load: ' + e.message;
+                console.error('Failed to initialize WASM:', e);
+            }
+        }
+
+        // Main emulation loop
+        function runLoop() {
+            if (!running || !emulator) return;
+
+            // Reduce cycle count slightly to allow UI updates if heavy
+            const cycles = emulator.run(20000);
+
+            // Get UART output
+            const output = emulator.get_uart_output();
+            if (output.length > 0) {
+                const text = new TextDecoder().decode(output);
+                terminal.write(text);
+            }
+
+            // Update stats
+            const currentTime = performance.now();
+            const elapsed = currentTime - lastTime;
+            if (elapsed > 200) { // Update stats every 200ms
+                const instrCount = BigInt(emulator.get_ips()); // This is now total count per lib.rs update
+                // Calculate IPS
+                // Note: instrCount is total, lastInstrCount is total at last check
+                const diff = instrCount - lastInstrCount;
+                const ips = Number(diff) / (elapsed / 1000);
+
+                document.getElementById('ips-display').textContent =
+                    formatNumber(ips) + ' IPS';
+                document.getElementById('stat-instr').textContent =
+                    formatNumber(Number(instrCount));
+
+                lastInstrCount = instrCount;
+                lastTime = currentTime;
+
+                // Update Debug View (expensive, so done with stats)
+                updateDebugView();
+            }
+
+            animationId = requestAnimationFrame(runLoop);
+        }
+
+        function formatNumber(n) {
+            if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G';
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return Math.round(n).toString();
+        }
+
+        // Event handlers
+        document.getElementById('btn-start').addEventListener('click', () => {
+            if (!emulator) return;
+            running = true;
+            document.getElementById('status-dot').classList.add('running');
+            document.getElementById('status-text').textContent = 'Running';
+            lastTime = performance.now(); // Reset time to avoid jump in IPS checking
+            lastInstrCount = BigInt(emulator.get_ips());
+            runLoop();
+        });
+
+        document.getElementById('btn-stop').addEventListener('click', () => {
+            running = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+            document.getElementById('status-dot').classList.remove('running');
+            document.getElementById('status-text').textContent = 'Stopped';
+            updateDebugView(); // Final update
+        });
+
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            running = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+            if (emulator) {
+                emulator.reset();
+            }
+            document.getElementById('status-dot').classList.remove('running');
+            document.getElementById('status-text').textContent = 'Reset';
+            terminal.clear();
+            terminal.writeln('\x1b[33mEmulator reset\x1b[0m');
+            updateDebugView();
+        });
+
+        document.getElementById('kernel-file').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file || !emulator) return;
+
+            const data = new Uint8Array(await file.arrayBuffer());
+            const isLinux = document.getElementById('linux-mode').checked;
+            const cmdline = document.getElementById('linux-cmdline').value;
+
+            try {
+                if (isLinux) {
+                    emulator.setup_linux(data, cmdline);
+                    terminal.writeln(`\x1b[32m✓ Setup Linux Boot: ${file.name}\x1b[0m`);
+                    terminal.writeln(`  Cmdline: ${cmdline}`);
+                } else {
+                    // Load at DRAM_BASE (0x80000000)
+                    emulator.load_kernel(data, 0x80000000);
+                    terminal.writeln(`\x1b[32m✓ Loaded ${file.name}\x1b[0m`);
+                }
+
+                document.getElementById('kernel-name').textContent =
+                    `Loaded: ${file.name} (${formatNumber(data.length)}B)`;
+
+                updateDebugView();
+            } catch (err) {
+                terminal.writeln(`\x1b[31m✗ Failed to load: ${err}\x1b[0m`);
+            }
+        });
+
+        document.getElementById('linux-mode').addEventListener('change', (e) => {
+            const opts = document.getElementById('linux-opts');
+            if (e.target.checked) {
+                opts.classList.remove('hidden');
+            } else {
+                opts.classList.add('hidden');
+            }
+        });
+
+        // Initialize
+        initRegisters();
+        initTerminal();
+        initWasm();
+    </script>
+</body>
+
+</html>
