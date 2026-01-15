@@ -273,18 +273,16 @@ impl System {
     /// Try to execute using JIT v2 compiled region
     /// Returns Some(cycles) if JIT execution happened, None if no JIT region available
     /// 
-    /// Uses VIRTUAL addresses throughout - no PA translation needed for JIT.
+    /// Uses PHYSICAL addresses for cache keying, like step_block_v2.
     fn try_jit_execution(&mut self) -> Option<u32> {
         let satp = self.cpu.csr.satp;
+        let mstatus = self.cpu.csr.mstatus;
+        let priv_level = self.cpu.priv_level;
         
         // Check if SATP changed - invalidate JIT cache on page table switch
         self.jit_state.check_satp(satp);
         
-        // Use VIRTUAL address directly
-        let vaddr = self.cpu.pc;
-        let page = Page::of(vaddr);
-        
-        // Create bus for execution
+        // Create bus for MMU translation and execution
         let mut bus = SystemBus::new(
             &mut self.memory,
             &mut self.uart,
@@ -293,16 +291,32 @@ impl System {
             &mut self.virtio9p,
         );
         
-        // Record execution for hotness tracking (using VA)
-        if let Some(hot_page) = self.jit_state.record_execution(vaddr, HEAT_PER_BLOCK) {
+        // Translate VA to PA
+        let paddr = match self.cpu.mmu.translate(
+            self.cpu.pc,
+            AccessType::Instruction,
+            priv_level,
+            &mut bus,
+            satp,
+            mstatus
+        ) {
+            Ok(pa) => pa,
+            Err(_) => return None, // Translation failed, let caller handle
+        };
+        
+        // Use PHYSICAL address for page lookup
+        let page = Page::of(paddr);
+        
+        // Record execution for hotness tracking (using PA)
+        if let Some(hot_page) = self.jit_state.record_execution(paddr, HEAT_PER_BLOCK) {
             // Page became hot - compile the region
             self.jit_state.compile_region(&mut bus, hot_page);
         }
         
-        // Try to execute using compiled region
+        // Try to execute using compiled region (keyed by PA)
         if let Some(region) = self.jit_state.get_region(page) {
-            // Execute the compiled region (uses VA directly)
-            match execute_region(&mut self.cpu, &mut bus, region) {
+            // Execute the compiled region
+            match execute_region(&mut self.cpu, &mut bus, region, paddr) {
                 RegionResult::Continue(next_pc) => {
                     self.cpu.pc = next_pc;
                     let inst_count = region.blocks.values()
@@ -433,68 +447,17 @@ impl System {
     
     /// Execute using JIT v2 (page-based with CFG optimization)
     /// 
-    /// JIT v2 uses VIRTUAL addresses throughout. The cache is invalidated
-    /// when SATP changes (page table switch) or on SFENCE.VMA.
+    /// NOTE: JIT v2 CFG execution is currently disabled due to VA/PA translation
+    /// issues in branch target computation. Falls back to v1 block execution
+    /// which correctly handles VA→PA translation.
     fn step_block_v2(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
-        let satp = self.cpu.csr.satp;
-        
-        // Check if SATP changed - invalidate JIT cache on page table switch
-        self.jit_state.check_satp(satp);
-        
-        // Use VIRTUAL address directly for JIT v2
-        let vaddr = self.cpu.pc;
-        let page = Page::of(vaddr);
-        
-        // Create bus for instruction fetch and execution
-        let mut bus = SystemBus::new(
-            &mut self.memory,
-            &mut self.uart,
-            &mut self.clint,
-            &mut self.plic,
-            &mut self.virtio9p,
-        );
-        
-        // Record execution for hotness tracking (using VA)
-        if let Some(hot_page) = self.jit_state.record_execution(vaddr, HEAT_PER_BLOCK) {
-            // Page became hot - compile the region
-            // Note: Bus reads will go through MMU translation
-            self.jit_state.compile_region(&mut bus, hot_page);
-        }
-        
-        // Try to execute using compiled region
-        if let Some(region) = self.jit_state.get_region(page) {
-            // Execute the compiled region (uses VA directly)
-            match execute_region(&mut self.cpu, &mut bus, region) {
-                RegionResult::Continue(next_pc) => {
-                    self.cpu.pc = next_pc;
-                    // Estimate instructions executed based on blocks in region
-                    let inst_count = region.blocks.values()
-                        .map(|b| b.instructions.len())
-                        .sum::<usize>() as u32;
-                    let inst_count = inst_count.max(1);
-                    drop(bus);
-                    self.virtio9p.process_queues(&mut self.memory);
-                    self.cpu.instruction_count += inst_count as u64;
-                    Ok(inst_count)
-                }
-                RegionResult::Exit(next_pc) => {
-                    self.cpu.pc = next_pc;
-                    drop(bus);
-                    self.virtio9p.process_queues(&mut self.memory);
-                    self.cpu.instruction_count += 1;
-                    Ok(1)
-                }
-                RegionResult::Trap(trap) => {
-                    drop(bus);
-                    self.virtio9p.process_queues(&mut self.memory);
-                    Err(trap)
-                }
-            }
-        } else {
-            // No compiled region yet - fallback to v1 execution
-            drop(bus);
-            self.step_block_v1()
-        }
+        // JIT v2's CFG-based execution has fundamental issues:
+        // - Branch targets are computed from PA but offsets are VA-relative
+        // - This causes wrong target addresses for cross-page branches
+        // 
+        // For now, just use v1's proven PA-based block execution.
+        // The v2 hotness tracking can be added later once CFG is fixed.
+        self.step_block_v1()
     }
     
     /// Execute one instruction, handling device I/O specially

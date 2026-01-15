@@ -1,10 +1,10 @@
 //! JIT state management
 //!
-//! JIT v2 works with virtual addresses. All blocks and pages are keyed by VA.
+//! JIT v2 works with physical addresses (PA). All blocks and pages are keyed by PA.
 //! The cache must be invalidated on:
+//! - FENCE.I instruction
 //! - SFENCE.VMA instruction
-//! - Privilege level changes (mstatus.MPRV, etc.)
-//! - SATP register changes
+//! - SATP register changes (causes full invalidation)
 
 use std::collections::{HashMap, HashSet};
 use super::types::{Page, CompiledRegion};

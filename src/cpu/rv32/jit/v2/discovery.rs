@@ -1,7 +1,7 @@
 //! Basic block discovery
 //!
-//! Discovers basic blocks using VIRTUAL addresses.
-//! The bus handles VA→PA translation when reading instructions.
+//! Discovers basic blocks using PHYSICAL addresses (PA).
+//! Entry points and block addresses are all physical addresses.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use super::types::{BasicBlock, BasicBlockType, BranchCondition, Page};

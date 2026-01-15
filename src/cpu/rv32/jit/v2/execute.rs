@@ -1,7 +1,7 @@
 //! Region execution
 //!
-//! Executes compiled regions using VIRTUAL addresses.
-//! All block lookups use cpu.pc (VA) directly.
+//! Executes compiled regions using PHYSICAL addresses (PA).
+//! All block lookups use PA, which is translated from cpu.pc (VA) by the caller.
 
 use std::collections::HashMap;
 use super::types::{BasicBlock, BasicBlockType, ControlFlowStructure, Page, RegionResult, CompiledRegion};
@@ -130,11 +130,13 @@ fn execute_structure(
 
 /// Execute a compiled region using structured control flow
 /// 
-/// All addresses are VIRTUAL. Uses cpu.pc directly for block lookups.
+/// All blocks are keyed by PHYSICAL address (PA).
+/// `start_paddr` is the physical address corresponding to current cpu.pc.
 pub fn execute_region(
     cpu: &mut Cpu,
     bus: &mut impl Bus,
     region: &CompiledRegion,
+    start_paddr: u32,
 ) -> RegionResult {
     let page = if let Some(&first_entry) = region.entry_points.first() {
         Page::of(first_entry)
@@ -142,23 +144,21 @@ pub fn execute_region(
         return RegionResult::Exit(cpu.pc);
     };
     
-    // Verify we're at a valid entry point (use virtual address directly)
-    let vaddr = cpu.pc;
-    if !region.blocks.contains_key(&vaddr) {
-        return RegionResult::Exit(vaddr);
+    // Use physical address for block lookup
+    let paddr = start_paddr;
+    if !region.blocks.contains_key(&paddr) {
+        return RegionResult::Exit(cpu.pc);
     }
     
-    // Execute starting from current block
-    if let Some(block) = region.blocks.get(&vaddr) {
+    // Execute starting from current block (keyed by PA)
+    if let Some(block) = region.blocks.get(&paddr) {
         match execute_basic_block(cpu, bus, block) {
             Ok(next_pc) => {
                 cpu.pc = next_pc;
-                // If next PC is outside this region, exit
-                if !page.contains(next_pc) || !region.blocks.contains_key(&next_pc) {
-                    return RegionResult::Exit(next_pc);
-                }
-                // Continue with regular structure execution
-                return execute_structure(cpu, bus, &region.structure, &region.blocks, page);
+                // For next iteration, we'd need to translate again
+                // But for now, just exit and let caller translate next VA
+                // This is simpler and avoids complexity of inline translation
+                return RegionResult::Exit(next_pc);
             }
             Err(trap) => return RegionResult::Trap(trap),
         }
