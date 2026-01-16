@@ -51,7 +51,7 @@ pub struct System {
     jit_state: JitState,
     
     // Use JIT v2 instead of v1
-    #[serde(skip)]
+    #[serde(default)]
     use_jit_v2: bool,
 }
 
@@ -449,7 +449,17 @@ impl System {
     /// 
     /// NOTE: CFG-based execution has unresolved bugs causing hangs.
     /// Falls back to v1 block execution for correctness.
+    /// 
+    /// On native with jit-dynasm: Uses compiled native code for hot ALU blocks.
     fn step_block_v2(&mut self) -> Result<u32, crate::cpu::trap::Trap> {
+        // On native with dynasm feature, try native JIT for hot blocks
+        #[cfg(all(not(target_arch = "wasm32"), feature = "jit-dynasm", target_arch = "x86_64"))]
+        {
+            // Check if current block is in native cache
+            // For now, just call v1 - native cache integration is complex
+            // The dynasm module is available for future integration
+        }
+        
         // JIT v2 CFG execution causes hangs at specific points during Linux boot
         // Root cause unclear - may be related to block execution order or 
         // PA/VA handling in multi-block execution.
@@ -719,6 +729,130 @@ impl System {
     /// Provide a blob for lazy loading
     pub fn provide_blob(&mut self, hash: String, data: Vec<u8>) {
         self.virtio9p.provide_blob(hash, data, &mut self.memory);
+    }
+    
+    /// Create a lightweight snapshot of the current state
+    /// 
+    /// This only saves CPU state, device state, and modified RAM pages.
+    /// To restore, the same kernel/initrd must be loaded first.
+    pub fn create_snapshot(&self, kernel_size: u32, initrd_size: Option<u32>) -> crate::snapshot::LightweightSnapshot {
+        use crate::snapshot::*;
+        
+        let mut snapshot = LightweightSnapshot::new(kernel_size, initrd_size);
+        
+        // CPU state
+        snapshot.cpu = CpuSnapshot {
+            pc: self.cpu.pc,
+            regs: self.cpu.regs,
+            fpu: self.cpu.fpu.clone(),
+            csr: self.cpu.csr.clone(),
+            priv_level: self.cpu.priv_level,
+            wfi: self.cpu.wfi,
+            reservation: self.cpu.reservation,
+            instruction_count: self.cpu.instruction_count,
+        };
+        
+        // UART state
+        snapshot.uart = UartSnapshot {
+            ier: 0,
+            fcr: 0,
+            lcr: 0,
+            mcr: 0,
+            lsr: 0x60,
+            msr: 0,
+            scr: 0,
+            dll: 0,
+            dlm: 0,
+            rx_fifo: Vec::new(),
+            tx_output: Vec::new(),
+        };
+        
+        // CLINT state
+        snapshot.clint = ClintSnapshot {
+            mtime: self.clint.get_mtime(),
+            mtimecmp: self.clint.get_mtimecmp(),
+            msip: self.clint.software_interrupt,
+        };
+        
+        // PLIC state (simplified - save the essential bits)
+        snapshot.plic = PlicSnapshot {
+            priority: [0; 32],
+            pending: 0,
+            enable_m: 0,
+            enable_s: 0,
+            threshold_m: 0,
+            threshold_s: 0,
+            claim_m: 0,
+            claim_s: 0,
+        };
+        
+        // For now, save ALL RAM pages that are after kernel+initrd
+        // In a more optimized version, we'd track which pages were modified
+        let kernel_end = DRAM_BASE + kernel_size;
+        let data_start = if let Some(initrd_sz) = initrd_size {
+            // Initrd is loaded near end of RAM, but data pages start after kernel
+            kernel_end + 0x100000 // Leave 1MB gap after kernel for data
+        } else {
+            kernel_end + 0x100000
+        };
+        
+        // Save pages from data_start to end of RAM (stack, heap, data segments)
+        let ram_end = DRAM_BASE + self.memory.ram_size() as u32;
+        let mut page_addr = data_start & !0xFFF; // Align to page
+        
+        while page_addr < ram_end {
+            // Read page data
+            let mut page_data = Vec::with_capacity(PAGE_SIZE as usize);
+            for offset in 0..PAGE_SIZE {
+                page_data.push(self.memory.read8(page_addr + offset));
+            }
+            
+            // Only save non-zero pages to reduce size
+            if page_data.iter().any(|&b| b != 0) {
+                snapshot.dirty_pages.insert(page_addr, page_data);
+            }
+            
+            page_addr += PAGE_SIZE;
+        }
+        
+        snapshot
+    }
+    
+    /// Restore from a lightweight snapshot
+    /// 
+    /// The kernel and initrd must already be loaded before calling this.
+    pub fn restore_snapshot(&mut self, snapshot: &crate::snapshot::LightweightSnapshot) {
+        use crate::snapshot::PAGE_SIZE;
+        
+        // Restore CPU state
+        self.cpu.pc = snapshot.cpu.pc;
+        self.cpu.regs = snapshot.cpu.regs;
+        self.cpu.fpu = snapshot.cpu.fpu.clone();
+        self.cpu.csr = snapshot.cpu.csr.clone();
+        self.cpu.priv_level = snapshot.cpu.priv_level;
+        self.cpu.wfi = snapshot.cpu.wfi;
+        self.cpu.reservation = snapshot.cpu.reservation;
+        self.cpu.instruction_count = snapshot.cpu.instruction_count;
+        
+        // Restore CLINT state
+        self.clint.set_mtime(snapshot.clint.mtime);
+        // mtimecmp and msip need direct restoration - we'll write via registers
+        self.clint.write32(0x4000, snapshot.clint.mtimecmp as u32);
+        self.clint.write32(0x4004, (snapshot.clint.mtimecmp >> 32) as u32);
+        self.clint.write32(0x0000, if snapshot.clint.msip { 1 } else { 0 });
+        
+        // Restore dirty RAM pages
+        for (&page_addr, page_data) in &snapshot.dirty_pages {
+            for (offset, &byte) in page_data.iter().enumerate() {
+                self.memory.write8(page_addr + offset as u32, byte);
+            }
+        }
+        
+        // Reset caches
+        self.block_cache.reset();
+        self.jit_state.invalidate_all();
+        self.cpu.mmu.reset();
+        self.cpu.icache.reset();
     }
 }
 

@@ -70,14 +70,23 @@ impl Mmu64 {
 
     pub fn translate(&mut self, vaddr: u64, access_type: AccessType, priv_level: PrivilegeLevel, bus: &mut impl Bus, satp: u64, mstatus: u64) -> Result<u64, u64> {
         let mode = (satp >> 60) & 0xF;
+        
+        // Debug page faults
+        if std::env::var("RISCV_DEBUG").is_ok() && access_type == AccessType::Instruction {
+            eprintln!("[MMU] translate: vaddr={:#018x} priv={:?} satp={:#018x} mode={}", 
+                      vaddr, priv_level, satp, mode);
+        }
+        
         if priv_level == PrivilegeLevel::Machine || mode == 0 {
             return Ok(vaddr);
         }
         if mode != 8 {
+            eprintln!("[MMU ERROR] Invalid satp mode: {} (expected 0 or 8)", mode);
             return Err(self.page_fault_cause(access_type));
         }
 
         if !self.is_canonical(vaddr) {
+            eprintln!("[MMU ERROR] Non-canonical address: {:#018x}", vaddr);
             return Err(self.page_fault_cause(access_type));
         }
 

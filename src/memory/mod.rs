@@ -337,6 +337,81 @@ impl Memory {
         }
     }
     
+    /// Initialize boot ROM for RV64
+    /// Same logic as RV32 but for 64-bit architecture
+    pub fn init_boot_rom_rv64(&mut self) {
+        // Boot ROM at 0x1000
+        // Acts as minimal M-mode firmware (OpenSBI-like)
+        //
+        // Linux expects:
+        // - a0 = hartid (set by setup_linux_boot)
+        // - a1 = dtb address (set by setup_linux_boot)
+        // - Running in S-mode with SBI available
+        
+        let instructions: [u32; 28] = [
+            // === Setup exception delegation ===
+            // Delegate most exceptions to S-mode
+            // medeleg = 0xB1FF
+            0x0000b2b7,           // lui t0, 0xB
+            0x1ff28293,           // addi t0, t0, 0x1FF
+            0x30229073,           // csrw medeleg, t0
+            
+            // Delegate S-mode interrupts (SSI, STI, SEI)
+            0x00000293,           // li t0, 0
+            0x22228293,           // addi t0, t0, 0x222
+            0x30329073,           // csrw mideleg, t0
+            
+            // === Setup mstatus for S-mode transition ===
+            // Set MPP = Supervisor (01), MPIE = 1
+            0x00000297,           // auipc t0, 0
+            0x00001337,           // lui t1, 1
+            0x88030313,           // addi t1, t1, -0x780  ; 0x880 (MPP=01, MPIE=1)
+            0x30031073,           // csrw mstatus, t1
+            
+            // === Set mepc to kernel entry ===
+            // RV64: Need to set mepc = 0x0000_0000_8000_0000 (NOT sign-extended!)
+            // lui t0, 0x80000 produces 0xFFFF_FFFF_8000_0000 (sign-extended from bit 31)
+            // We need to clear the upper 32 bits using slli+srli
+            0x800002b7,           // lui t0, 0x80000      ; t0 = 0xFFFF_FFFF_8000_0000 (sign-extended)
+            0x02029293,           // slli t0, t0, 32     ; t0 = 0x8000_0000_0000_0000 (shift left, clears upper bits)
+            0x0202d293,           // srli t0, t0, 32     ; t0 = 0x0000_0000_8000_0000 (correct!)
+            0x34129073,           // csrw mepc, t0
+            
+            // === Set mtvec for SBI handler ===
+            0x000012b7,           // lui t0, 0x1          ; t0 = 0x1000
+            0x08028293,           // addi t0, t0, 0x80    ; t0 = 0x1080
+            0x30529073,           // csrw mtvec, t0
+            
+            // === Enable counter access from S-mode ===
+            0x00700293,           // li t0, 7
+            0x30629073,           // csrw mcounteren, t0
+            
+            // === Jump to S-mode using MRET ===
+            0x30200073,           // mret
+            
+            // === Padding ===
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+            0x00000013,           // nop
+        ];
+        
+        for (i, &inst) in instructions.iter().enumerate() {
+            let offset = i * 4;
+            self.rom[offset] = inst as u8;
+            self.rom[offset + 1] = (inst >> 8) as u8;
+            self.rom[offset + 2] = (inst >> 16) as u8;
+            self.rom[offset + 3] = (inst >> 24) as u8;
+        }
+        
+        // Add SBI trap handler stub
+        self.init_sbi_handler();
+    }
+    
     /// Load binary data into RAM
     pub fn load_binary(&mut self, data: &[u8], addr: u32) -> Result<(), String> {
         if addr < self.ram_base {

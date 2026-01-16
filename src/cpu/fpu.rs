@@ -79,7 +79,7 @@ impl FFlags {
 }
 
 /// Floating-point register file and state
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Fpu {
     /// Floating-point registers (64-bit each for D extension, NaN-boxed for F)
     pub fregs: [u64; 32],

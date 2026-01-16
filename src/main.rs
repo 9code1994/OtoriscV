@@ -7,7 +7,7 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 use std::time::{Duration, Instant};
 
 // Use the library crate's modules
-use otoriscv::System;
+use otoriscv::{System, System64};
 
 // Set stdin to non-blocking mode
 fn set_nonblocking(fd: i32, nonblocking: bool) {
@@ -64,6 +64,7 @@ struct BenchmarkConfig {
     enabled: bool,
     exit_on_prompt: bool,
     jit_v2: bool,
+    rv64: bool,
 }
 
 struct BenchmarkResult {
@@ -147,6 +148,71 @@ fn run_emulator(system: &mut System, config: &BenchmarkConfig) -> io::Result<Ben
     })
 }
 
+fn run_emulator_64(system: &mut System64, config: &BenchmarkConfig) -> io::Result<BenchmarkResult> {
+    let start = Instant::now();
+    let mut boot_time: Option<Duration> = None;
+    let mut instructions: u64 = 0;
+    let max_cycles = 10_000_000_000u64;
+    let mut stdin_buf = [0u8; 16];
+    let mut prompt_buffer: Vec<u8> = Vec::new();
+    const PROMPT_BUFFER_MAX: usize = 128;
+
+    loop {
+        let n = unsafe {
+            libc::read(0, stdin_buf.as_mut_ptr() as *mut libc::c_void, stdin_buf.len())
+        };
+        if n > 0 {
+            for i in 0..n as usize {
+                let c = if stdin_buf[i] == b'\r' { b'\n' } else { stdin_buf[i] };
+                system.uart_receive(c);
+            }
+        }
+
+        let cycles_to_run = 1000000;
+        let cycles_run = system.run(cycles_to_run);
+        instructions += cycles_run as u64;
+
+        let output = system.uart_get_output();
+        if !output.is_empty() {
+            stdout().write_all(&output)?;
+            stdout().flush()?;
+            if config.enabled && boot_time.is_none() {
+                prompt_buffer.extend_from_slice(&output);
+                if prompt_buffer.len() > PROMPT_BUFFER_MAX {
+                    let excess = prompt_buffer.len() - PROMPT_BUFFER_MAX;
+                    prompt_buffer.drain(0..excess);
+                }
+                if output_has_prompt(&prompt_buffer) {
+                    boot_time = Some(start.elapsed());
+                    if config.exit_on_prompt {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if system.cpu.pc == 0 {
+            println!("\nPC jumped to 0, halting.");
+            break;
+        }
+
+        if instructions > max_cycles {
+            println!("\nTimeout reached, halting.");
+            break;
+        }
+
+        if cycles_run == 0 {
+            break;
+        }
+    }
+
+    Ok(BenchmarkResult {
+        wall_time: start.elapsed(),
+        boot_time,
+        instructions: system.get_instruction_count(),
+    })
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut kernel_path = String::new();
@@ -161,6 +227,7 @@ fn main() -> io::Result<()> {
         enabled: false,
         exit_on_prompt: false,
         jit_v2: false,
+        rv64: false,
     };
 
     let mut i = 1;
@@ -200,6 +267,9 @@ fn main() -> io::Result<()> {
                 i += 1;
                 fs_path = args[i].clone();
             }
+            "--rv64" => {
+                config.rv64 = true;
+            }
             arg if !arg.starts_with("-") => {
                 kernel_path = arg.to_string();
             }
@@ -211,11 +281,11 @@ fn main() -> io::Result<()> {
     }
 
     if kernel_path.is_empty() {
-        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark] [--inline-switch] [--jit-v2]", args[0]);
+        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--rv64] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark] [--jit-v2]", args[0]);
         std::process::exit(1);
     }
     
-    println!("OtoriscV CLI");
+    println!("OtoriscV CLI {}", if config.rv64 { "(RV64)" } else { "(RV32)" });
     println!("Loading kernel: {}", kernel_path);
     if !initrd_path.is_empty() {
         println!("Loading initrd: {}", initrd_path);
@@ -225,42 +295,28 @@ fn main() -> io::Result<()> {
     }
     println!("RAM Size: {} MB", ram_size_mb);
     
-    let fs_option = if !fs_path.is_empty() { Some(fs_path.as_str()) } else { None };
-    let mut system = System::new(ram_size_mb, fs_option).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    
-    // Enable JIT v2 if requested (experimental, has VA/PA bugs)
-    if config.jit_v2 {
-        eprintln!("WARNING: JIT v2 is experimental and has known bugs (VA/PA mismatch)");
-        system.enable_jit_v2(true);
-    }
-    
     // Helper function to load and decompress files
     fn load_file_with_decompression(path: &str) -> io::Result<Vec<u8>> {
         let file = File::open(path)?;
         let path_obj = Path::new(path);
         let mut data = Vec::new();
         
-        // Detect file type by extension
         if let Some(ext) = path_obj.extension() {
             match ext.to_str() {
                 Some("gz") => {
-                    // Gzip decompression
                     let mut decoder = GzDecoder::new(file);
                     decoder.read_to_end(&mut data)?;
                 }
                 Some("zst") => {
-                    // Zstd decompression
                     let mut decoder = ZstdDecoder::new(file)?;
                     decoder.read_to_end(&mut data)?;
                 }
                 _ => {
-                    // Raw file
                     let mut f = file;
                     f.read_to_end(&mut data)?;
                 }
             }
         } else {
-            // No extension, assume raw
             let mut f = file;
             f.read_to_end(&mut data)?;
         }
@@ -268,99 +324,157 @@ fn main() -> io::Result<()> {
         Ok(data)
     }
     
-    // Read kernel file (with automatic decompression)
     let kernel_data = load_file_with_decompression(&kernel_path)?;
-    
-    // Read initrd if provided (with automatic decompression)
     let initrd_data = if !initrd_path.is_empty() {
         Some(load_file_with_decompression(&initrd_path)?)
     } else {
         None
     };
     
-    if raw_mode {
-        system.load_binary(&kernel_data, 0x80000000).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        system.cpu.pc = 0x80000000;
+    let cmdline = if initrd_data.is_some() {
+        "lpj=10000 console=ttyS0 earlycon rdinit=/sbin/init"
     } else {
-        // Setup Linux boot with optional initrd
-        // lpj=10000 skips delay calibration loop for fast boot in emulator
-        // Use console=ttyS0 for NS16550 UART
-        let cmdline = if initrd_data.is_some() {
-            "lpj=10000 console=ttyS0 earlycon rdinit=/sbin/init"
-        } else {
-            "lpj=10000 console=ttyS0 earlycon root=/dev/vda ro"
-        };
+        "lpj=10000 console=ttyS0 earlycon root=/dev/vda ro"
+    };
+    
+    // Dispatch between RV32 and RV64
+    if config.rv64 {
+        // RV64 mode
+        let fs_option = if !fs_path.is_empty() { Some(fs_path.as_str()) } else { None };
+        let mut system = System64::new(ram_size_mb, fs_option).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         
-        system.setup_linux_boot_with_initrd(
-            &kernel_data, 
-            initrd_data.as_deref(), 
-            cmdline
-        ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    }
-    
-    println!("System ready. Starting emulation...");
-    println!("-------------------------------------");
-    
-    // Enable raw terminal mode for interactive input
-    set_raw_terminal(true);
-    set_nonblocking(0, true);
-    
-    // Ensure we restore terminal on exit
-    let result = run_emulator(&mut system, &config);
-    
-    // Restore terminal
-    set_raw_terminal(false);
-    set_nonblocking(0, false);
-    
-    let bench_result = result?;
-
-    if config.enabled {
-        let wall_secs = bench_result.wall_time.as_secs_f64();
-        let ips = if wall_secs > 0.0 {
-            (bench_result.instructions as f64) / wall_secs
+        if raw_mode {
+            system.load_binary(&kernel_data, 0x80000000).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            system.cpu.pc = 0x80000000;
         } else {
-            0.0
-        };
-        let (tlb_hits, tlb_misses) = system.get_tlb_stats();
-        let tlb_total = tlb_hits + tlb_misses;
-        let tlb_hit_rate = if tlb_total > 0 {
-            (tlb_hits as f64) / (tlb_total as f64)
-        } else {
-            0.0
-        };
-        println!("\nBenchmark results:");
-        if let Some(bt) = bench_result.boot_time {
-            println!("  Boot time: {:.3}s", bt.as_secs_f64());
-        } else {
-            println!("  Boot time: N/A (prompt not detected)");
-        }
-        println!("  Instructions: {}", bench_result.instructions);
-        println!("  IPS: {:.3}", ips);
-        if tlb_total > 0 {
-            println!("  TLB hit rate: {:.3}", tlb_hit_rate);
-        } else {
-            println!("  TLB hit rate: N/A (paging disabled)");
-        }
-    }
-
-    // Dump signature if requested
-    if !signature_file.is_empty() && sig_begin != 0 && sig_end != 0 {
-        let mut sig_data = String::new();
-        let mut addr = sig_begin;
-        while addr < sig_end {
-             // Read memory (4 bytes at a time)
-             let bytes = system.read_memory(addr, 4);
-             if bytes.len() == 4 {
-                 let val = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                 // Format as lower-case hex, 8 digits, one per line
-                 sig_data.push_str(&format!("{:08x}\n", val));
-             }
-             addr += 4;
+            system.setup_linux_boot_with_initrd(
+                &kernel_data, 
+                initrd_data.as_deref(), 
+                cmdline
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
         
-        let mut f = File::create(signature_file)?;
-        f.write_all(sig_data.as_bytes())?;
-        println!("Signature dumped.");
+        println!("System ready. Starting RV64 emulation...");
+        println!("-------------------------------------");
+        
+        set_raw_terminal(true);
+        set_nonblocking(0, true);
+        
+        let result = run_emulator_64(&mut system, &config);
+        
+        set_raw_terminal(false);
+        set_nonblocking(0, false);
+        
+        let bench_result = result?;
+        
+        if config.enabled {
+            let wall_secs = bench_result.wall_time.as_secs_f64();
+            let ips = if wall_secs > 0.0 {
+                (bench_result.instructions as f64) / wall_secs
+            } else {
+                0.0
+            };
+            let (tlb_hits, tlb_misses) = system.get_tlb_stats();
+            let tlb_total = tlb_hits + tlb_misses;
+            let tlb_hit_rate = if tlb_total > 0 {
+                (tlb_hits as f64) / (tlb_total as f64)
+            } else {
+                0.0
+            };
+            println!("\nBenchmark results:");
+            if let Some(bt) = bench_result.boot_time {
+                println!("  Boot time: {:.3}s", bt.as_secs_f64());
+            } else {
+                println!("  Boot time: N/A (prompt not detected)");
+            }
+            println!("  Instructions: {}", bench_result.instructions);
+            println!("  IPS: {:.3}", ips);
+            if tlb_total > 0 {
+                println!("  TLB hit rate: {:.3}", tlb_hit_rate);
+            } else {
+                println!("  TLB hit rate: N/A (paging disabled)");
+            }
+        }
+    } else {
+        // RV32 mode
+        let fs_option = if !fs_path.is_empty() { Some(fs_path.as_str()) } else { None };
+        let mut system = System::new(ram_size_mb, fs_option).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        if config.jit_v2 {
+            eprintln!("WARNING: JIT v2 is experimental and has known bugs (VA/PA mismatch)");
+            system.enable_jit_v2(true);
+        }
+        
+        if raw_mode {
+            system.load_binary(&kernel_data, 0x80000000).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            system.cpu.pc = 0x80000000;
+        } else {
+            system.setup_linux_boot_with_initrd(
+                &kernel_data, 
+                initrd_data.as_deref(), 
+                cmdline
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+        
+        println!("System ready. Starting emulation...");
+        println!("-------------------------------------");
+        
+        set_raw_terminal(true);
+        set_nonblocking(0, true);
+        
+        let result = run_emulator(&mut system, &config);
+        
+        set_raw_terminal(false);
+        set_nonblocking(0, false);
+        
+        let bench_result = result?;
+
+        if config.enabled {
+            let wall_secs = bench_result.wall_time.as_secs_f64();
+            let ips = if wall_secs > 0.0 {
+                (bench_result.instructions as f64) / wall_secs
+            } else {
+                0.0
+            };
+            let (tlb_hits, tlb_misses) = system.get_tlb_stats();
+            let tlb_total = tlb_hits + tlb_misses;
+            let tlb_hit_rate = if tlb_total > 0 {
+                (tlb_hits as f64) / (tlb_total as f64)
+            } else {
+                0.0
+            };
+            println!("\nBenchmark results:");
+            if let Some(bt) = bench_result.boot_time {
+                println!("  Boot time: {:.3}s", bt.as_secs_f64());
+            } else {
+                println!("  Boot time: N/A (prompt not detected)");
+            }
+            println!("  Instructions: {}", bench_result.instructions);
+            println!("  IPS: {:.3}", ips);
+            if tlb_total > 0 {
+                println!("  TLB hit rate: {:.3}", tlb_hit_rate);
+            } else {
+                println!("  TLB hit rate: N/A (paging disabled)");
+            }
+        }
+
+        // Dump signature if requested (RV32 only for now)
+        if !signature_file.is_empty() && sig_begin != 0 && sig_end != 0 {
+            let mut sig_data = String::new();
+            let mut addr = sig_begin;
+            while addr < sig_end {
+                let bytes = system.read_memory(addr, 4);
+                if bytes.len() == 4 {
+                    let val = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    sig_data.push_str(&format!("{:08x}\n", val));
+                }
+                addr += 4;
+            }
+            
+            let mut f = File::create(signature_file)?;
+            f.write_all(sig_data.as_bytes())?;
+            println!("Signature dumped.");
+        }
     }
     
     Ok(())

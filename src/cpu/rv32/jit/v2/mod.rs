@@ -11,7 +11,7 @@ pub mod cfg;
 pub mod discovery;
 pub mod state;
 pub mod execute;
-pub mod wasm;
+pub mod codegen;
 
 // Re-export commonly used types
 pub use types::{
@@ -20,6 +20,8 @@ pub use types::{
 };
 pub use state::{JitState, HEAT_PER_BLOCK, JIT_THRESHOLD};
 pub use execute::{execute_region, execute_region_linear};
+pub use codegen::{CodegenExit, CodegenError, DefaultCodegen};
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::builder::WasmBuilder;
+pub use codegen::wasm::WasmCodegen;
+

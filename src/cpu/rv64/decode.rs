@@ -1,6 +1,6 @@
 //! Instruction decoder
 //!
-//! Decodes RV64IMAFD instructions
+//! Decodes RV64IMAFDCB instructions
 
 /// Decoded instruction fields
 #[derive(Debug)]

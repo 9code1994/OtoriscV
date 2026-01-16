@@ -101,7 +101,7 @@ pub struct Csr64 {
 impl Csr64 {
     pub fn new() -> Self {
         Csr64 {
-            misa: (2u64 << 62) | (1 << 8) | (1 << 12) | (1 << 0) | (1 << 18) | (1 << 5) | (1 << 3) | (1 << 2),
+            misa: (2u64 << 62) | (1 << 8) | (1 << 12) | (1 << 0) | (1 << 18) | (1 << 5) | (1 << 3) | (1 << 2) | (1 << 1),
             mstatus: MSTATUS_FS,
             medeleg: 0,
             mideleg: 0,
@@ -229,7 +229,7 @@ impl Csr64 {
         self.medeleg = 0;
         self.mideleg = 0;
         self.mie = 0;
-        self.mtvec = 0;
+        self.mtvec = 0x1080;  // Point to SBI handler to avoid PC=0 on early traps
         self.mcounteren = 0;
         self.mscratch = 0;
         self.mepc = 0;

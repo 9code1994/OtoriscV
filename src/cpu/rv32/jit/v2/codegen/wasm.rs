@@ -1,9 +1,7 @@
 //! WebAssembly code generation for JIT compiled regions
 
 #[cfg(target_arch = "wasm32")]
-pub mod builder {
-    //! WebAssembly bytecode builder
-    
+mod builder_impl {
     use std::collections::HashMap;
     
     /// WebAssembly opcodes
@@ -88,15 +86,10 @@ pub mod builder {
     
     /// WebAssembly module builder
     pub struct WasmBuilder {
-        /// Output bytecode for function body
         code: Vec<u8>,
-        /// Label stack for control flow
         label_stack: Vec<Label>,
-        /// Next label ID
         next_label: u32,
-        /// Label to stack depth mapping
         label_depths: HashMap<Label, usize>,
-        /// Number of local variables
         local_count: u32,
     }
     
@@ -111,7 +104,6 @@ pub mod builder {
             }
         }
         
-        /// Reset builder for new function
         pub fn reset(&mut self) {
             self.code.clear();
             self.label_stack.clear();
@@ -120,21 +112,16 @@ pub mod builder {
             self.local_count = 0;
         }
         
-        /// Get generated code
         pub fn get_code(&self) -> &[u8] {
             &self.code
         }
         
-        /// Allocate a new local variable
         pub fn alloc_local(&mut self) -> u32 {
             let idx = self.local_count;
             self.local_count += 1;
             idx
         }
         
-        // === Control Flow ===
-        
-        /// Begin a block (forward jump target)
         pub fn block_void(&mut self) -> Label {
             let label = Label(self.next_label);
             self.next_label += 1;
@@ -145,7 +132,6 @@ pub mod builder {
             label
         }
         
-        /// Begin a loop (backward jump target)
         pub fn loop_void(&mut self) -> Label {
             let label = Label(self.next_label);
             self.next_label += 1;
@@ -156,134 +142,56 @@ pub mod builder {
             label
         }
         
-        /// End a block or loop
         pub fn end(&mut self) {
             self.label_stack.pop();
             self.code.push(op::OP_END);
         }
         
-        /// Unconditional branch
         pub fn br(&mut self, label: Label) {
             let depth = self.label_depth(label);
             self.code.push(op::OP_BR);
             self.write_leb128_u32(depth);
         }
         
-        /// Conditional branch (if top of stack is non-zero)
         pub fn br_if(&mut self, label: Label) {
             let depth = self.label_depth(label);
             self.code.push(op::OP_BR_IF);
             self.write_leb128_u32(depth);
         }
         
-        /// Branch table (switch)
-        pub fn br_table(&mut self, labels: &[Label], default: Label) {
-            self.code.push(op::OP_BR_TABLE);
-            self.write_leb128_u32(labels.len() as u32);
-            for &label in labels {
-                let depth = self.label_depth(label);
-                self.write_leb128_u32(depth);
-            }
-            let default_depth = self.label_depth(default);
-            self.write_leb128_u32(default_depth);
-        }
-        
-        /// If-then (condition on stack)
-        pub fn if_void(&mut self) -> Label {
-            let label = Label(self.next_label);
-            self.next_label += 1;
-            self.label_depths.insert(label, self.label_stack.len());
-            self.label_stack.push(label);
-            self.code.push(op::OP_IF);
-            self.code.push(op::TYPE_VOID);
-            label
-        }
-        
-        /// Else branch
-        pub fn else_(&mut self) {
-            self.code.push(op::OP_ELSE);
-        }
-        
-        /// Return from function
-        pub fn return_(&mut self) {
-            self.code.push(op::OP_RETURN);
-        }
-        
-        // === Local Variables ===
-        
-        /// Get local variable
-        pub fn local_get(&mut self, idx: u32) {
-            self.code.push(op::OP_LOCAL_GET);
-            self.write_leb128_u32(idx);
-        }
-        
-        /// Set local variable
-        pub fn local_set(&mut self, idx: u32) {
-            self.code.push(op::OP_LOCAL_SET);
-            self.write_leb128_u32(idx);
-        }
-        
-        /// Tee local variable (set and keep on stack)
-        pub fn local_tee(&mut self, idx: u32) {
-            self.code.push(op::OP_LOCAL_TEE);
-            self.write_leb128_u32(idx);
-        }
-        
-        // === Constants ===
-        
-        /// Push i32 constant
         pub fn i32_const(&mut self, value: i32) {
             self.code.push(op::OP_I32_CONST);
             self.write_leb128_i32(value);
         }
         
-        // === Arithmetic ===
+        pub fn local_get(&mut self, idx: u32) {
+            self.code.push(op::OP_LOCAL_GET);
+            self.write_leb128_u32(idx);
+        }
+        
+        pub fn local_set(&mut self, idx: u32) {
+            self.code.push(op::OP_LOCAL_SET);
+            self.write_leb128_u32(idx);
+        }
+        
+        pub fn return_(&mut self) {
+            self.code.push(op::OP_RETURN);
+        }
         
         pub fn i32_add(&mut self) { self.code.push(op::OP_I32_ADD); }
         pub fn i32_sub(&mut self) { self.code.push(op::OP_I32_SUB); }
-        pub fn i32_mul(&mut self) { self.code.push(op::OP_I32_MUL); }
-        pub fn i32_div_s(&mut self) { self.code.push(op::OP_I32_DIV_S); }
-        pub fn i32_div_u(&mut self) { self.code.push(op::OP_I32_DIV_U); }
-        pub fn i32_rem_s(&mut self) { self.code.push(op::OP_I32_REM_S); }
-        pub fn i32_rem_u(&mut self) { self.code.push(op::OP_I32_REM_U); }
         pub fn i32_and(&mut self) { self.code.push(op::OP_I32_AND); }
         pub fn i32_or(&mut self) { self.code.push(op::OP_I32_OR); }
         pub fn i32_xor(&mut self) { self.code.push(op::OP_I32_XOR); }
         pub fn i32_shl(&mut self) { self.code.push(op::OP_I32_SHL); }
         pub fn i32_shr_s(&mut self) { self.code.push(op::OP_I32_SHR_S); }
         pub fn i32_shr_u(&mut self) { self.code.push(op::OP_I32_SHR_U); }
-        
-        // === Comparison ===
-        
-        pub fn i32_eqz(&mut self) { self.code.push(op::OP_I32_EQZ); }
-        pub fn i32_eq(&mut self) { self.code.push(op::OP_I32_EQ); }
-        pub fn i32_ne(&mut self) { self.code.push(op::OP_I32_NE); }
         pub fn i32_lt_s(&mut self) { self.code.push(op::OP_I32_LT_S); }
         pub fn i32_lt_u(&mut self) { self.code.push(op::OP_I32_LT_U); }
-        pub fn i32_gt_s(&mut self) { self.code.push(op::OP_I32_GT_S); }
-        pub fn i32_gt_u(&mut self) { self.code.push(op::OP_I32_GT_U); }
-        pub fn i32_le_s(&mut self) { self.code.push(op::OP_I32_LE_S); }
-        pub fn i32_le_u(&mut self) { self.code.push(op::OP_I32_LE_U); }
         pub fn i32_ge_s(&mut self) { self.code.push(op::OP_I32_GE_S); }
         pub fn i32_ge_u(&mut self) { self.code.push(op::OP_I32_GE_U); }
-        
-        // === Memory ===
-        
-        /// Load i32 from memory (address on stack)
-        pub fn i32_load(&mut self, align: u32, offset: u32) {
-            self.code.push(op::OP_I32_LOAD);
-            self.write_leb128_u32(align);
-            self.write_leb128_u32(offset);
-        }
-        
-        /// Store i32 to memory (address and value on stack)
-        pub fn i32_store(&mut self, align: u32, offset: u32) {
-            self.code.push(op::OP_I32_STORE);
-            self.write_leb128_u32(align);
-            self.write_leb128_u32(offset);
-        }
-        
-        // === Helpers ===
+        pub fn i32_eq(&mut self) { self.code.push(op::OP_I32_EQ); }
+        pub fn i32_ne(&mut self) { self.code.push(op::OP_I32_NE); }
         
         fn label_depth(&self, label: Label) -> u32 {
             let target_depth = *self.label_depths.get(&label).unwrap();
@@ -325,3 +233,26 @@ pub mod builder {
         }
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+pub use builder_impl::WasmBuilder;
+
+/// WASM codegen backend
+/// Currently a stub - falls back to interpreter
+#[cfg(target_arch = "wasm32")]
+pub struct WasmCodegen;
+
+#[cfg(target_arch = "wasm32")]
+impl WasmCodegen {
+    pub fn new() -> Self {
+        WasmCodegen
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Default for WasmCodegen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+

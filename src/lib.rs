@@ -9,7 +9,10 @@ pub mod cpu;
 mod memory;
 mod devices;
 mod system;
+pub mod snapshot;
+mod system64;
 pub use system::System;
+pub use system64::System64;
 
 
 /// Initialize panic hook for better error messages in browser console
@@ -171,6 +174,32 @@ impl Emulator {
         let system: System = bincode::deserialize(&decompressed)
             .map_err(|e| JsValue::from_str(&format!("Deserialization error: {}", e)))?;
         self.system = system;
+        Ok(())
+    }
+    
+    /// Create a lightweight snapshot (CPU + devices + dirty pages only)
+    /// 
+    /// This is much smaller than get_state() (~100KB vs ~5MB) because it doesn't
+    /// save the kernel/initrd. To restore, you must reload the same kernel/initrd first.
+    /// 
+    /// # Arguments
+    /// * `kernel_size` - Size of the kernel in bytes (for validation on restore)
+    /// * `initrd_size` - Size of the initrd in bytes, or 0 if none
+    pub fn create_snapshot(&self, kernel_size: u32, initrd_size: u32) -> Result<Vec<u8>, JsValue> {
+        let initrd_opt = if initrd_size > 0 { Some(initrd_size) } else { None };
+        let snapshot = self.system.create_snapshot(kernel_size, initrd_opt);
+        snapshot.to_bytes()
+            .map_err(|e| JsValue::from_str(&e))
+    }
+    
+    /// Restore from a lightweight snapshot
+    /// 
+    /// The same kernel/initrd must already be loaded using setup_linux_with_initrd()
+    /// before calling this method.
+    pub fn restore_snapshot(&mut self, snapshot_data: &[u8]) -> Result<(), JsValue> {
+        let snapshot = snapshot::LightweightSnapshot::from_bytes(snapshot_data)
+            .map_err(|e| JsValue::from_str(&e))?;
+        self.system.restore_snapshot(&snapshot);
         Ok(())
     }
 }

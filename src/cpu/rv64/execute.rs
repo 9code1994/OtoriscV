@@ -205,6 +205,12 @@ impl Cpu64 {
                 let shamt = (imm & 0x3F) as u32;
                 let funct6 = (inst >> 26) & 0x3F;
 
+                if let Some(result) = self.execute_bitmanip_imm(inst, &d, rs1) {
+                    self.write_reg(d.rd, result);
+                    self.pc = self.pc.wrapping_add(4);
+                    return Ok(());
+                }
+
                 let result = match d.funct3 {
                     FUNCT3_ADD_SUB => rs1.wrapping_add(imm),
                     FUNCT3_SLT => if (rs1 as i64) < (imm as i64) { 1 } else { 0 },
@@ -230,7 +236,9 @@ impl Cpu64 {
                 let rs1 = self.read_reg(d.rs1);
                 let rs2 = self.read_reg(d.rs2);
 
-                let result = if d.funct7 == 0b0000001 {
+                let result = if let Some(result) = self.execute_bitmanip_op(d.funct7, d.funct3, rs1, rs2) {
+                    result
+                } else if d.funct7 == 0b0000001 {
                     self.execute_m_extension(d.funct3, rs1, rs2)?
                 } else {
                     match (d.funct3, d.funct7) {
@@ -252,32 +260,59 @@ impl Cpu64 {
                 self.pc = self.pc.wrapping_add(4);
             }
             OP_OP_IMM_32 => {
-                let rs1 = self.read_reg(d.rs1) as u32;
+                let rs1_full = self.read_reg(d.rs1);
+                let imm12 = (inst >> 20) & 0xFFF;
+                let funct6 = (inst >> 26) & 0x3F;
+
+                if d.funct3 == FUNCT3_SLL && funct6 == 0b000010 {
+                    let shamt = (imm12 & 0x3F) as u32;
+                    let result = (rs1_full as u32 as u64) << shamt;
+                    self.write_reg(d.rd, result);
+                    self.pc = self.pc.wrapping_add(4);
+                    return Ok(());
+                }
+
+                let rs1 = rs1_full as u32;
                 let imm = DecodedInst::imm_i(inst) as u32;
                 let shamt = (imm & 0x1F) as u32;
                 let funct7 = (inst >> 25) & 0x7F;
 
-                let result = match d.funct3 {
-                    FUNCT3_ADD_SUB => (rs1 as i32).wrapping_add(imm as i32) as u32,
-                    FUNCT3_SLL => rs1 << shamt,
-                    FUNCT3_SRL_SRA => {
-                        if funct7 == 0b0100000 {
-                            ((rs1 as i32) >> shamt) as u32
-                        } else {
-                            rs1 >> shamt
+                let result = if let Some(result) = self.execute_bitmanip_imm_w(inst, &d, rs1) {
+                    result
+                } else {
+                    match d.funct3 {
+                        FUNCT3_ADD_SUB => (rs1 as i32).wrapping_add(imm as i32) as u32,
+                        FUNCT3_SLL => rs1 << shamt,
+                        FUNCT3_SRL_SRA => {
+                            if funct7 == 0b0100000 {
+                                ((rs1 as i32) >> shamt) as u32
+                            } else {
+                                rs1 >> shamt
+                            }
                         }
+                        _ => return Err(Trap64::IllegalInstruction(inst as u64)),
                     }
-                    _ => return Err(Trap64::IllegalInstruction(inst as u64)),
                 };
 
                 self.write_reg(d.rd, (result as i32 as i64) as u64);
                 self.pc = self.pc.wrapping_add(4);
             }
             OP_OP_32 => {
-                let rs1 = self.read_reg(d.rs1) as u32;
-                let rs2 = self.read_reg(d.rs2) as u32;
+                let rs1_full = self.read_reg(d.rs1);
+                let rs2_full = self.read_reg(d.rs2);
 
-                let result = if d.funct7 == 0b0000001 {
+                if let Some(result) = self.execute_bitmanip_op_uw(d.funct7, d.funct3, rs1_full, rs2_full) {
+                    self.write_reg(d.rd, result);
+                    self.pc = self.pc.wrapping_add(4);
+                    return Ok(());
+                }
+
+                let rs1 = rs1_full as u32;
+                let rs2 = rs2_full as u32;
+
+                let result = if let Some(result) = self.execute_bitmanip_op_w(d.funct7, d.funct3, rs1, rs2) {
+                    result
+                } else if d.funct7 == 0b0000001 {
                     self.execute_m_extension_w(d.funct3, rs1, rs2)?
                 } else {
                     match (d.funct3, d.funct7) {
@@ -321,6 +356,119 @@ impl Cpu64 {
         }
 
         Ok(())
+    }
+
+    fn execute_bitmanip_imm(&self, inst: u32, d: &DecodedInst, rs1: u64) -> Option<u64> {
+        let imm12 = (inst >> 20) & 0xFFF;
+        let funct6 = (inst >> 26) & 0x3F;
+        let shamt = (imm12 & 0x3F) as u32;
+
+        match d.funct3 {
+            FUNCT3_SLL => {
+                match imm12 {
+                    0x600 => Some(rs1.leading_zeros() as u64),
+                    0x601 => Some(rs1.trailing_zeros() as u64),
+                    0x602 => Some(rs1.count_ones() as u64),
+                    0x604 => Some((rs1 as i8 as i64) as u64),
+                    0x605 => Some((rs1 as i16 as i64) as u64),
+                    _ => match funct6 {
+                        0x0A => Some(rs1 | (1u64 << shamt)),
+                        0x12 => Some(rs1 & !(1u64 << shamt)),
+                        0x1A => Some(rs1 ^ (1u64 << shamt)),
+                        _ => None,
+                    },
+                }
+            }
+            FUNCT3_SRL_SRA => {
+                if imm12 == 0x287 {
+                    return Some(Self::orc_b(rs1));
+                }
+                if imm12 == 0x6B8 {
+                    return Some(rs1.swap_bytes());
+                }
+                match funct6 {
+                    0x12 => Some((rs1 >> shamt) & 1),
+                    0x18 => Some(rs1.rotate_right(shamt)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn execute_bitmanip_op(&self, funct7: u32, funct3: u32, rs1: u64, rs2: u64) -> Option<u64> {
+        let shamt = (rs2 & 0x3F) as u32;
+        match (funct7, funct3) {
+            (0x10, 0x2) => Some(rs2.wrapping_add(rs1 << 1)),
+            (0x10, 0x4) => Some(rs2.wrapping_add(rs1 << 2)),
+            (0x10, 0x6) => Some(rs2.wrapping_add(rs1 << 3)),
+            (0x20, 0x7) => Some(rs1 & !rs2),
+            (0x20, 0x6) => Some(rs1 | !rs2),
+            (0x20, 0x4) => Some(!(rs1 ^ rs2)),
+            (0x05, 0x4) => Some(if (rs1 as i64) < (rs2 as i64) { rs1 } else { rs2 }),
+            (0x05, 0x5) => Some(if rs1 < rs2 { rs1 } else { rs2 }),
+            (0x05, 0x6) => Some(if (rs1 as i64) > (rs2 as i64) { rs1 } else { rs2 }),
+            (0x05, 0x7) => Some(if rs1 > rs2 { rs1 } else { rs2 }),
+            (0x30, 0x1) => Some(rs1.rotate_left(shamt)),
+            (0x30, 0x5) => Some(rs1.rotate_right(shamt)),
+            (0x14, 0x1) => Some(rs1 | (1u64 << shamt)),
+            (0x24, 0x1) => Some(rs1 & !(1u64 << shamt)),
+            (0x24, 0x5) => Some((rs1 >> shamt) & 1),
+            (0x34, 0x1) => Some(rs1 ^ (1u64 << shamt)),
+            _ => None,
+        }
+    }
+
+    fn execute_bitmanip_op_uw(&self, funct7: u32, funct3: u32, rs1: u64, rs2: u64) -> Option<u64> {
+        let rs1_uw = rs1 as u32 as u64;
+        match (funct7, funct3) {
+            (0x04, 0x0) => Some(rs2.wrapping_add(rs1_uw)),
+            (0x10, 0x2) => Some(rs2.wrapping_add(rs1_uw << 1)),
+            (0x10, 0x4) => Some(rs2.wrapping_add(rs1_uw << 2)),
+            (0x10, 0x6) => Some(rs2.wrapping_add(rs1_uw << 3)),
+            _ => None,
+        }
+    }
+
+    fn execute_bitmanip_imm_w(&self, inst: u32, d: &DecodedInst, rs1: u32) -> Option<u32> {
+        let imm12 = (inst >> 20) & 0xFFF;
+        let funct7 = (inst >> 25) & 0x7F;
+
+        match d.funct3 {
+            FUNCT3_SLL => match imm12 {
+                0x600 => Some(rs1.leading_zeros()),
+                0x601 => Some(rs1.trailing_zeros()),
+                0x602 => Some(rs1.count_ones()),
+                _ => None,
+            },
+            FUNCT3_SRL_SRA => {
+                if funct7 == 0x30 {
+                    let shamt = (imm12 & 0x1F) as u32;
+                    return Some(rs1.rotate_right(shamt));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn execute_bitmanip_op_w(&self, funct7: u32, funct3: u32, rs1: u32, rs2: u32) -> Option<u32> {
+        let shamt = (rs2 & 0x1F) as u32;
+        match (funct7, funct3) {
+            (0x30, 0x1) => Some(rs1.rotate_left(shamt)),
+            (0x30, 0x5) => Some(rs1.rotate_right(shamt)),
+            _ => None,
+        }
+    }
+
+    fn orc_b(value: u64) -> u64 {
+        let mut out = 0u64;
+        for i in 0..8u32 {
+            let byte = (value >> (i * 8)) & 0xFF;
+            let expanded = if byte == 0 { 0 } else { 0xFF };
+            out |= expanded << (i * 8);
+        }
+        out
     }
 
     fn execute_system(&mut self, inst: u32, d: &DecodedInst, _bus: &mut impl Bus) -> Result<(), Trap64> {

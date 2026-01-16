@@ -1,8 +1,9 @@
-//! RV64IMAFD CPU module
+//! RV64IMAFDCB CPU module
 //!
 //! Implements the RISC-V 64-bit base integer instruction set
 //! with M (multiply/divide), A (atomic), F (single-precision float),
-//! and D (double-precision float) extensions.
+//! D (double-precision float), C (compressed), and B (bitmanip) extensions.
+//! Includes Sv39 virtual memory support.
 
 pub mod csr;
 mod decode;
@@ -10,7 +11,7 @@ mod execute;
 mod execute_fp;
 mod execute_c;
 pub mod mmu;
-mod trap;
+pub mod trap;
 
 pub use csr::Csr64;
 pub use mmu::Mmu64;
@@ -90,6 +91,12 @@ impl Cpu64 {
         };
 
         let inst = self.read_inst(bus, paddr)?;
+        
+        // Debug instruction execution in potential infinite loops
+        if std::env::var("RISCV_DEBUG").is_ok() && self.pc >= 0x800010fe && self.pc <= 0x80001110 {
+            eprintln!("[CPU] PC={:#018x} inst={:#010x}", self.pc, inst);
+        }
+        
         if (inst & 0b11) != 0b11 {
             self.execute_compressed(inst as u16, bus)?;
         } else {
