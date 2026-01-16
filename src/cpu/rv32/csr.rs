@@ -73,7 +73,7 @@ pub const MIP_SEIP: u32 = 1 << 9;  // Supervisor external interrupt
 pub const MIP_MEIP: u32 = 1 << 11; // Machine external interrupt
 
 /// CSR storage
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Csr {
     /// MSTATUS register
     pub mstatus: u32,

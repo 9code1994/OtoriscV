@@ -3,6 +3,8 @@
 //! Compiles sequences of instructions into blocks that execute together,
 //! reducing the per-instruction overhead of interpretation.
 
+pub mod codegen;
+
 use std::collections::HashMap;
 use crate::cpu::Cpu;
 use super::super::icache::CachedInst;
@@ -30,6 +32,12 @@ pub struct CompiledBlock {
     pub instructions: Vec<CachedInst>,
     /// Generation counter for invalidation
     pub generation: u32,
+    /// Compiled native code (dynasm, feature-gated)
+    #[cfg(all(not(target_arch = "wasm32"), feature = "jit-dynasm", target_arch = "x86_64"))]
+    pub native_code: Option<codegen::dynasm::NativeBlock>,
+    /// Compiled WASM code (wasm32 target only)
+    #[cfg(target_arch = "wasm32")]
+    pub wasm_code: Option<codegen::runtime::CompiledWasmBlock>,
 }
 
 /// Block cache - stores compiled basic blocks
@@ -104,11 +112,59 @@ impl BlockCache {
             }
         }
 
+        // Try to compile to native x86_64 code (if feature enabled)
+        #[cfg(all(not(target_arch = "wasm32"), feature = "jit-dynasm", target_arch = "x86_64"))]
+        let native_code = {
+            if codegen::dynasm::can_compile(&instructions) {
+                codegen::dynasm::compile_block(&instructions)
+            } else {
+                None
+            }
+        };
+
+        // Try to compile to WASM (if wasm32 target)
+        #[cfg(target_arch = "wasm32")]
+        let wasm_code = {
+            use codegen::emit;
+            use codegen::wasm::WasmBuilder;
+            
+            // Check if all instructions can be compiled
+            let can_compile = instructions.iter().all(|inst| {
+                use super::super::decode::*;
+                inst.opcode == OP_LUI as u8 || inst.opcode == OP_OP as u8 || inst.opcode == OP_OP_IMM as u8
+            });
+            
+            if can_compile {
+                let mut builder = WasmBuilder::new();
+                let mut success = true;
+                
+                for inst in &instructions {
+                    if !emit::emit_instruction(&mut builder, inst, start_paddr) {
+                        success = false;
+                        break;
+                    }
+                }
+                
+                if success {
+                    let bytecode = builder.get_code();
+                    codegen::runtime::CompiledWasmBlock::compile(bytecode)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
         let block = CompiledBlock {
             start_paddr,
             inst_count: instructions.len() as u32,
             instructions,
             generation: self.generation,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "jit-dynasm", target_arch = "x86_64"))]
+            native_code,
+            #[cfg(target_arch = "wasm32")]
+            wasm_code,
         };
 
         self.blocks.insert(start_paddr, block);
@@ -169,6 +225,26 @@ fn is_block_terminator(opcode: u8) -> bool {
 /// Returns the result indicating next PC, trap, or need for interpreter fallback
 #[inline(always)]
 pub fn execute_block(cpu: &mut Cpu, block: &CompiledBlock, bus: &mut impl Bus) -> BlockResult {
+    // Try native execution first (if available)
+    #[cfg(all(not(target_arch = "wasm32"), feature = "jit-dynasm", target_arch = "x86_64"))]
+    if let Some(ref native_block) = block.native_code {
+        // Execute native code - it modifies registers in-place
+        let inst_count = native_block.execute(&mut cpu.regs);
+        // Update PC by advancing by the number of instructions executed
+        cpu.pc = cpu.pc.wrapping_add(inst_count * 4);
+        return BlockResult::Continue(cpu.pc);
+    }
+
+    // Try WASM execution (if available)
+    #[cfg(target_arch = "wasm32")]
+    if let Some(ref wasm_block) = block.wasm_code {
+        // Execute WASM code - it modifies registers in-place
+        let next_pc = wasm_block.execute(&mut cpu.regs);
+        cpu.pc = next_pc;
+        return BlockResult::Continue(cpu.pc);
+    }
+
+    // Fall back to interpreter execution
     let inst_count = block.instructions.len();
     
     for (i, cached) in block.instructions.iter().enumerate() {

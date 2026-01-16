@@ -1,10 +1,9 @@
-//! Unified code generation backends for JIT v2
+//! Unified code generation backends for JIT v1
 //!
-//! This module provides a common trait for different code generation backends:
+//! This module provides code generation backends for basic block JIT:
 //! - Interpreter (default, always available)
 //! - WASM (wasm32 target)
 //! - dynasm-rs (native, feature-gated)
-//! - Cranelift (native, feature-gated)
 
 use crate::cpu::trap::Trap;
 
