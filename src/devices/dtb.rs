@@ -57,6 +57,15 @@ impl DtbBuilder {
         data.push(0); // Null terminator
         self.property(name, &data);
     }
+
+    pub fn property_string_list(&mut self, name: &str, values: &[&str]) {
+        let mut data = Vec::new();
+        for value in values {
+            data.extend_from_slice(value.as_bytes());
+            data.push(0);
+        }
+        self.property(name, &data);
+    }
     
     pub fn property_array_u32(&mut self, name: &str, values: &[u32]) {
         let mut data = Vec::with_capacity(values.len() * 4);
@@ -344,8 +353,7 @@ pub fn generate_fdt_rv64(ram_size_mb: u32, cmdline: &str, initrd: Option<(u32, u
         
         // PLIC at 0x0C000000 (matches system64.rs PLIC_BASE)
         dtb.begin_node("plic@c000000");
-        dtb.property_string("compatible", "sifive,plic-1.0.0");
-        dtb.property_string("compatible", "riscv,plic0");
+        dtb.property_string_list("compatible", &["sifive,plic-1.0.0", "riscv,plic0"]);
         dtb.property_array_u32("interrupts-extended", &[1, 11, 1, 9]); 
         dtb.property_array_u32("reg", &[0, 0x0c000000, 0, 0x4000000]);
         dtb.property_u32("riscv,ndev", 96); 

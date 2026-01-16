@@ -34,7 +34,10 @@ fn sanitize_satp(value: u64) -> u64 {
 impl Cpu64 {
     pub fn execute(&mut self, inst: u32, bus: &mut impl Bus) -> Result<(), Trap64> {
         let d = DecodedInst::decode(inst);
+        self.execute_decoded(inst, &d, bus)
+    }
 
+    pub fn execute_decoded(&mut self, inst: u32, d: &DecodedInst, bus: &mut impl Bus) -> Result<(), Trap64> {
         match d.opcode {
             OP_LUI => {
                 let imm = DecodedInst::imm_u(inst) as i32 as i64 as u64;
@@ -357,6 +360,7 @@ impl Cpu64 {
             OP_MISC_MEM => {
                 if d.funct3 == 0b001 {
                     self.mmu.invalidate();
+                    self.cache_invalidation_pending = true;
                 }
                 self.pc = self.pc.wrapping_add(4);
             }
@@ -528,6 +532,7 @@ impl Cpu64 {
                 _ => {
                     if (inst >> 25) == 0b0001001 {
                         self.mmu.invalidate();
+                        self.cache_invalidation_pending = true;
                         self.pc = self.pc.wrapping_add(4);
                         return Ok(());
                     }

@@ -348,7 +348,7 @@ impl Memory {
         // - a1 = dtb address (set by setup_linux_boot)
         // - Running in S-mode with SBI available
         
-        let instructions: [u32; 28] = [
+        let instructions: [u32; 27] = [
             // === Setup exception delegation ===
             // Delegate most exceptions to S-mode
             // medeleg = 0xB1FF
@@ -373,10 +373,10 @@ impl Memory {
             0x30429073,           // csrw mie, t0
             
             // === Setup mstatus for S-mode transition ===
-            // Set MPP = Supervisor (01), MPIE = 1
-            0x00000297,           // auipc t0, 0
-            0x00001337,           // lui t1, 1
-            0x88030313,           // addi t1, t1, -0x780  ; 0x880 (MPP=01, MPIE=1)
+            // Set MPP = Supervisor (01), MPIE = 1, FS = Initial (01)
+            // 0x2880 = MPP[12:11]=01, MPIE[7]=1, FS[14:13]=01 (Initial)
+            0x00003337,           // lui t1, 3            ; t1 = 0x3000
+            0x88030313,           // addi t1, t1, -0x780  ; t1 = 0x3000 - 0x780 = 0x2880
             0x30031073,           // csrw mstatus, t1
             
             // === Set mepc to kernel entry ===

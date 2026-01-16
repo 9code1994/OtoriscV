@@ -2,7 +2,7 @@
 //!
 //! Brings together CPU64, memory, and devices for 64-bit RISC-V execution
 
-use crate::cpu::rv64::Cpu64;
+use crate::cpu::rv64::{Cpu64, BlockCache, BlockResult, execute_block, mmu::AccessType};
 use crate::cpu::rv64::csr::*;
 use crate::memory::{Memory, Bus, DRAM_BASE};
 use crate::devices::{Uart, Clint, Plic, Virtio9p};
@@ -35,6 +35,10 @@ pub struct System64 {
     pub clint: Clint,
     plic: Plic,
     virtio9p: Virtio9p,
+    #[serde(skip)]
+    block_cache: BlockCache,
+    #[serde(skip)]
+    use_jit_v1: bool,
 }
 
 impl System64 {
@@ -67,7 +71,13 @@ impl System64 {
             clint: Clint::new(),
             plic: Plic::new(),
             virtio9p: Virtio9p::new("rootfs", fs_backend),
+            block_cache: BlockCache::new(),
+            use_jit_v1: false,
         })
+    }
+
+    pub fn enable_jit_v1(&mut self, enable: bool) {
+        self.use_jit_v1 = enable;
     }
 
     /// Load a binary at the specified address
@@ -211,6 +221,11 @@ impl System64 {
                 }
             }
 
+            if self.cpu.cache_invalidation_pending {
+                self.block_cache.invalidate_all();
+                self.cpu.cache_invalidation_pending = false;
+            }
+
             if self.cpu.wfi {
                 let pending = self.cpu.csr.mip & self.cpu.csr.mie;
                 if pending != 0 {
@@ -233,7 +248,13 @@ impl System64 {
                 }
             }
 
-            match self.step() {
+            let step_result = if self.use_jit_v1 {
+                self.step_block_v1()
+            } else {
+                self.step()
+            };
+
+            match step_result {
                 Ok(inst_count) => {
                     cycles += inst_count;
                     self.cpu.csr.cycle = self.cpu.csr.cycle.wrapping_add(inst_count as u64);
@@ -305,6 +326,84 @@ impl System64 {
         drop(bus);
         self.virtio9p.process_queues(&mut self.memory);
         Ok(1)
+    }
+
+    /// Execute using JIT v1 (simple block cache)
+    fn step_block_v1(&mut self) -> Result<u32, crate::cpu::rv64::trap::Trap64> {
+        let satp = self.cpu.csr.satp;
+        let mstatus = self.cpu.csr.mstatus;
+        let priv_level = self.cpu.priv_level;
+
+        let mut bus = SystemBus64::new(
+            &mut self.memory,
+            &mut self.uart,
+            &mut self.clint,
+            &mut self.plic,
+            &mut self.virtio9p,
+        );
+
+        let paddr = match self.cpu.mmu.translate(
+            self.cpu.pc,
+            AccessType::Instruction,
+            priv_level,
+            &mut bus,
+            satp,
+            mstatus,
+        ) {
+            Ok(pa) => pa,
+            Err(cause) => {
+                return Err(crate::cpu::rv64::trap::Trap64::from_cause(cause, self.cpu.pc));
+            }
+        };
+
+        let block_exists = self.block_cache.get(paddr).is_some();
+
+        if block_exists {
+            let block = self.block_cache.get_block(paddr).unwrap();
+            let inst_count = block.inst_count;
+
+            match execute_block(&mut self.cpu, block, &mut bus) {
+                BlockResult::Continue(_) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count = self.cpu.instruction_count.wrapping_add(inst_count as u64);
+                    Ok(inst_count)
+                }
+                BlockResult::Trap(trap) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    Err(trap)
+                }
+                BlockResult::Interpret => {
+                    drop(bus);
+                    let result = self.step();
+                    result.map(|_| 1)
+                }
+            }
+        } else {
+            self.block_cache.compile_block(&mut bus, paddr);
+            let block = self.block_cache.get_block(paddr).unwrap();
+            let inst_count = block.inst_count;
+
+            match execute_block(&mut self.cpu, block, &mut bus) {
+                BlockResult::Continue(_) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    self.cpu.instruction_count = self.cpu.instruction_count.wrapping_add(inst_count as u64);
+                    Ok(inst_count)
+                }
+                BlockResult::Trap(trap) => {
+                    drop(bus);
+                    self.virtio9p.process_queues(&mut self.memory);
+                    Err(trap)
+                }
+                BlockResult::Interpret => {
+                    drop(bus);
+                    let result = self.step();
+                    result.map(|_| 1)
+                }
+            }
+        }
     }
 
     fn update_interrupts(&mut self) {
@@ -514,6 +613,7 @@ impl System64 {
         self.clint.reset();
         self.plic.reset();
         self.virtio9p.reset();
+        self.block_cache.reset();
     }
 }
 

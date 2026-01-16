@@ -10,12 +10,14 @@ mod decode;
 mod execute;
 mod execute_fp;
 mod execute_c;
+mod jit;
 pub mod mmu;
 pub mod trap;
 pub mod debug;
 
 pub use csr::Csr64;
 pub use mmu::Mmu64;
+pub use jit::{BlockCache, BlockResult, execute_block};
 
 use super::PrivilegeLevel;
 use super::fpu::Fpu;
@@ -38,6 +40,8 @@ pub struct Cpu64 {
     pub priv_level: PrivilegeLevel,
     /// Wait for interrupt (WFI executed)
     pub wfi: bool,
+    /// Flag set when instruction cache needs invalidation (FENCE.I, SFENCE.VMA)
+    pub cache_invalidation_pending: bool,
     /// Reservation set for LR/SC (address, valid)
     pub reservation: Option<u64>,
     /// Instruction counter for performance
@@ -64,6 +68,7 @@ impl Cpu64 {
             csr: Csr64::new(),
             priv_level: PrivilegeLevel::Machine,
             wfi: false,
+            cache_invalidation_pending: false,
             reservation: None,
             instruction_count: 0,
             mmu: Mmu64::new(),
@@ -153,6 +158,7 @@ impl Cpu64 {
         self.csr.reset();
         self.priv_level = PrivilegeLevel::Machine;
         self.wfi = false;
+        self.cache_invalidation_pending = false;
         self.reservation = None;
         self.mmu.reset();
     }

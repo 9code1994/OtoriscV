@@ -63,6 +63,7 @@ fn set_raw_terminal(enable: bool) {
 struct BenchmarkConfig {
     enabled: bool,
     exit_on_prompt: bool,
+    jit_v1: bool,
     jit_v2: bool,
     rv64: bool,
 }
@@ -226,6 +227,7 @@ fn main() -> io::Result<()> {
     let mut config = BenchmarkConfig {
         enabled: false,
         exit_on_prompt: false,
+        jit_v1: false,
         jit_v2: false,
         rv64: false,
     };
@@ -263,6 +265,9 @@ fn main() -> io::Result<()> {
             "--jit-v2" => {
                 config.jit_v2 = true;
             }
+            "--jit-v1" => {
+                config.jit_v1 = true;
+            }
             "--fs" => {
                 i += 1;
                 fs_path = args[i].clone();
@@ -281,7 +286,7 @@ fn main() -> io::Result<()> {
     }
 
     if kernel_path.is_empty() {
-        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--rv64] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark] [--jit-v2]", args[0]);
+        eprintln!("Usage: {} <kernel-image> [--initrd <initrd>] [--ram <mb>] [--fs <host-path>] [--rv64] [--signature <file> --begin <addr> --end <addr>] [--raw] [--benchmark] [--jit-v1] [--jit-v2]", args[0]);
         std::process::exit(1);
     }
     
@@ -334,7 +339,7 @@ fn main() -> io::Result<()> {
     // RV64 uses SBI earlycon (sbi_console_putchar), RV32 uses UART earlycon
     let cmdline = if config.rv64 {
         if initrd_data.is_some() {
-            "earlycon=sbi console=hvc0 rdinit=/sbin/init"
+            "earlycon=sbi console=hvc0 rdinit=/bin/sh" // busybox rootfs still broken for now
         } else {
             "earlycon=sbi console=hvc0 root=/dev/vda ro"
         }
@@ -351,7 +356,11 @@ fn main() -> io::Result<()> {
         // RV64 mode
         let fs_option = if !fs_path.is_empty() { Some(fs_path.as_str()) } else { None };
         let mut system = System64::new(ram_size_mb, fs_option).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
+
+        if config.jit_v1 {
+            system.enable_jit_v1(true);
+        }
+
         if raw_mode {
             system.load_binary(&kernel_data, 0x80000000).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             system.cpu.pc = 0x80000000;
