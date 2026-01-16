@@ -9,9 +9,40 @@ impl Cpu64 {
     pub fn execute_compressed(&mut self, inst16: u16, bus: &mut impl Bus) -> Result<(), Trap64> {
         let expanded = expand_compressed(inst16).ok_or(Trap64::IllegalInstruction(inst16 as u64))?;
         let pc_before = self.pc;
+        let d = DecodedInst::decode(expanded);
+        let rs1_val = self.read_reg(d.rs1);
+        let rs2_val = self.read_reg(d.rs2);
+
         self.execute(expanded, bus)?;
-        if self.pc == pc_before.wrapping_add(4) {
-            self.pc = pc_before.wrapping_add(2);
+
+        match d.opcode {
+            OP_BRANCH => {
+                let imm = DecodedInst::imm_b(expanded) as i64 as u64;
+                let taken = match d.funct3 {
+                    FUNCT3_BEQ => rs1_val == rs2_val,
+                    FUNCT3_BNE => rs1_val != rs2_val,
+                    FUNCT3_BLT => (rs1_val as i64) < (rs2_val as i64),
+                    FUNCT3_BGE => (rs1_val as i64) >= (rs2_val as i64),
+                    FUNCT3_BLTU => rs1_val < rs2_val,
+                    FUNCT3_BGEU => rs1_val >= rs2_val,
+                    _ => return Err(Trap64::IllegalInstruction(expanded as u64)),
+                };
+                if taken {
+                    self.pc = pc_before.wrapping_add(imm);
+                } else {
+                    self.pc = pc_before.wrapping_add(2);
+                }
+            }
+            OP_JAL | OP_JALR => {
+                if d.rd != 0 {
+                    self.write_reg(d.rd, pc_before.wrapping_add(2));
+                }
+            }
+            _ => {
+                if self.pc == pc_before.wrapping_add(4) {
+                    self.pc = pc_before.wrapping_add(2);
+                }
+            }
         }
         Ok(())
     }

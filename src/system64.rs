@@ -107,8 +107,8 @@ impl System64 {
             None
         };
 
-        // Generate DTB
-        let dtb = crate::devices::dtb::generate_fdt(ram_size_mb, cmdline, initrd_info);
+        // Generate DTB for RV64 (uses QEMU virt-like addresses)
+        let dtb = crate::devices::dtb::generate_fdt_rv64(ram_size_mb, cmdline, initrd_info);
         let dtb_addr = (ram_end - dtb.len() as u32) & !0xFFF;
 
         self.load_binary(&dtb, dtb_addr)?;
@@ -138,6 +138,67 @@ impl System64 {
         
         let mut cycles = 0u32;
         const TIMER_BATCH: u32 = 64;
+        const STALL_SAME_PC_THRESHOLD: u32 = 100_000;
+        const STALL_LOOP_THRESHOLD: u32 = 50_000;
+        const LOOP_PERIOD_MAX: usize = 8;
+        let mut pc_history = [0u64; LOOP_PERIOD_MAX];
+        let mut pc_hist_idx: usize = 0;
+        let mut pc_hist_filled: usize = 0;
+        let mut loop_counts = [0u32; LOOP_PERIOD_MAX + 1];
+        let mut wfi_logged = false;
+
+        let mut update_stall = |cpu: &Cpu64| {
+            if !debug {
+                return;
+            }
+            if cpu.wfi {
+                if !wfi_logged {
+                    eprintln!(
+                        "[STALL] WFI entered at PC={:#018x} satp={:#018x} priv={:?}",
+                        cpu.pc, cpu.csr.satp, cpu.priv_level
+                    );
+                    wfi_logged = true;
+                }
+            } else {
+                wfi_logged = false;
+            }
+
+            for period in 1..=LOOP_PERIOD_MAX {
+                let threshold = if period == 1 {
+                    STALL_SAME_PC_THRESHOLD
+                } else {
+                    STALL_LOOP_THRESHOLD
+                };
+                if pc_hist_filled >= period {
+                    let prev_idx = (pc_hist_idx + LOOP_PERIOD_MAX - period) % LOOP_PERIOD_MAX;
+                    if cpu.pc == pc_history[prev_idx] {
+                        loop_counts[period] = loop_counts[period].saturating_add(1);
+                        if loop_counts[period] >= threshold {
+                            if period == 1 {
+                                eprintln!(
+                                    "[STALL] PC stuck at {:#018x} satp={:#018x} priv={:?}",
+                                    cpu.pc, cpu.csr.satp, cpu.priv_level
+                                );
+                            } else {
+                                eprintln!(
+                                    "[STALL] PC repeating (period {}) at {:#018x} satp={:#018x} priv={:?}",
+                                    period, cpu.pc, cpu.csr.satp, cpu.priv_level
+                                );
+                            }
+                            loop_counts[period] = 0;
+                        }
+                    } else {
+                        loop_counts[period] = 0;
+                    }
+                } else {
+                    loop_counts[period] = 0;
+                }
+            }
+
+            pc_history[pc_hist_idx] = cpu.pc;
+            pc_hist_idx = (pc_hist_idx + 1) % LOOP_PERIOD_MAX;
+            pc_hist_filled = (pc_hist_filled + 1).min(LOOP_PERIOD_MAX);
+        };
 
         while cycles < max_cycles {
             if cycles & (TIMER_BATCH - 1) == 0 {
@@ -162,10 +223,12 @@ impl System64 {
                             self.clint.tick(skip as u64);
                             self.cpu.csr.time = self.clint.get_mtime();
                             cycles += skip;
+                            update_stall(&self.cpu);
                             continue;
                         }
                     }
                     cycles += 1;
+                    update_stall(&self.cpu);
                     continue;
                 }
             }
@@ -180,20 +243,50 @@ impl System64 {
                     if matches!(trap, crate::cpu::rv64::trap::Trap64::EnvironmentCallFromS) {
                         if debug {
                             let eid = self.cpu.regs[17];
+                            let fid = self.cpu.regs[16];
                             let a0 = self.cpu.regs[10];
-                            eprintln!("[SBI] eid={:#x} a0={:#x} PC={:#018x}", eid, a0, self.cpu.pc);
+                            eprintln!("[SBI] eid={:#x} fid={} a0={:#x} PC={:#018x}", eid, fid, a0, self.cpu.pc);
                         }
                         self.handle_sbi_call();
                     } else {
                         if debug {
-                            eprintln!("[TRAP] {:?} at PC={:#018x}", trap, self.cpu.pc);
+                            if let crate::cpu::rv64::trap::Trap64::Breakpoint(_) = trap {
+                                let a4 = self.cpu.regs[14];
+                                let a5 = self.cpu.regs[15];
+                                let s1 = self.cpu.regs[9];
+                                let satp = self.cpu.csr.satp;
+                                let page_offset = if satp == 0 && s1 <= u32::MAX as u64 {
+                                    Some(self.memory.read64(s1 as u32))
+                                } else {
+                                    None
+                                };
+                                if let Some(page_offset) = page_offset {
+                                    eprintln!(
+                                        "[TRAP] Breakpoint ctx: a4={:#018x} a5={:#018x} s1={:#018x} page_offset={:#018x} satp={:#018x}",
+                                        a4, a5, s1, page_offset, satp
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[TRAP] Breakpoint ctx: a4={:#018x} a5={:#018x} s1={:#018x} page_offset=<unreadable> satp={:#018x}",
+                                        a4, a5, s1, satp
+                                    );
+                                }
+                            }
+                            eprintln!("[TRAP] {:?} at PC={:#018x}, mepc will be={:#018x}", 
+                                     trap, self.cpu.pc, self.cpu.pc);
                         }
                         self.cpu.handle_trap(trap);
+                        if debug {
+                            eprintln!("[TRAP] After handle: PC={:#018x} priv={:?} satp={:#018x}", 
+                                     self.cpu.pc, self.cpu.priv_level, self.cpu.csr.satp);
+                        }
                     }
                     cycles += 1;
                     self.cpu.csr.cycle = self.cpu.csr.cycle.wrapping_add(1);
                 }
             }
+
+            update_stall(&self.cpu);
         }
 
         cycles
@@ -215,11 +308,12 @@ impl System64 {
     }
 
     fn update_interrupts(&mut self) {
+        // For S-mode kernel, only set STIP (S-mode timer interrupt)
+        // Setting MTIP would cause M-mode interrupt which traps to M-mode handler
+        // and we don't have a proper M-mode handler (just infinite loop)
         if self.clint.timer_interrupt {
-            self.cpu.csr.mip |= MIP_MTIP;
             self.cpu.csr.mip |= MIP_STIP;
         } else {
-            self.cpu.csr.mip &= !MIP_MTIP;
             self.cpu.csr.mip &= !MIP_STIP;
         }
 
@@ -272,13 +366,25 @@ impl System64 {
             SBI_EXT_LEGACY_SET_TIMER => {
                 // RV64: Timer is single 64-bit value in a0
                 let timer_val = a0;
+                if std::env::var("RISCV_DEBUG").is_ok() {
+                    eprintln!("[SBI] set_timer: mtime={} mtimecmp <- {}", 
+                        self.clint.get_mtime(), timer_val);
+                }
                 self.clint.write32(0x4000, timer_val as u32);      // mtimecmp low
                 self.clint.write32(0x4004, (timer_val >> 32) as u32);  // mtimecmp high
+                // Clear pending timer interrupt when setting new timer
+                self.cpu.csr.mip &= !MIP_STIP;
+                self.cpu.csr.mip &= !MIP_MTIP;
                 (SBI_SUCCESS, 0)
             }
             
             SBI_EXT_LEGACY_CONSOLE_PUTCHAR => {
-                self.uart.write8(0, a0 as u8);
+                let c = a0 as u8;
+                self.uart.write8(0, c);
+                // Log first 100 chars to see boot messages
+                if std::env::var("RISCV_DEBUG").is_ok() && (c.is_ascii_graphic() || c == b'\n' || c == b' ') {
+                    eprint!("{}", c as char);
+                }
                 (SBI_SUCCESS, 0)
             }
             
@@ -306,6 +412,9 @@ impl System64 {
                             0x53525354 => 0,  // SBI_EXT_SRST
                             _ => 0,
                         };
+                        if std::env::var("RISCV_DEBUG").is_ok() {
+                            eprintln!("[SBI] probe_extension({:#x}) -> {}", probe_eid, available);
+                        }
                         (SBI_SUCCESS, available)
                     }
                     4 => (SBI_SUCCESS, 0),  // sbi_get_mvendorid
@@ -320,8 +429,15 @@ impl System64 {
                     0 => {
                         // sbi_set_timer: RV64 has single 64-bit value in a0
                         let timer_val = a0;
+                        if std::env::var("RISCV_DEBUG").is_ok() {
+                            eprintln!("[SBI] TIME.set_timer: mtime={} mtimecmp <- {}", 
+                                self.clint.get_mtime(), timer_val);
+                        }
                         self.clint.write32(0x4000, timer_val as u32);
                         self.clint.write32(0x4004, (timer_val >> 32) as u32);
+                        // Clear pending timer interrupt when setting new timer
+                        self.cpu.csr.mip &= !MIP_STIP;
+                        self.cpu.csr.mip &= !MIP_MTIP;
                         (SBI_SUCCESS, 0)
                     }
                     _ => (SBI_ERR_NOT_SUPPORTED, 0),

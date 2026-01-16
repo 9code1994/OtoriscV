@@ -8,6 +8,29 @@ use super::trap::{self, Trap64};
 use crate::cpu::PrivilegeLevel;
 use crate::memory::Bus;
 
+const SATP_MODE_MASK: u64 = 0xF << 60;
+
+fn satp_mode_limit() -> u64 {
+    match std::env::var("RISCV_SATP_MODE").ok().as_deref() {
+        Some("0") | Some("bare") => 0,
+        Some("8") | Some("39") | Some("sv39") => 8,
+        Some("9") | Some("48") | Some("sv48") => 9,
+        Some("10") | Some("57") | Some("sv57") => 10,
+        _ => 10,
+    }
+}
+
+fn sanitize_satp(value: u64) -> u64 {
+    let mode = (value >> 60) & 0xF;
+    let max_mode = satp_mode_limit();
+    let legal_mode = match mode {
+        0 => 0,
+        8 | 9 | 10 => if mode > max_mode { 0 } else { mode },
+        _ => 0,
+    };
+    (value & !SATP_MODE_MASK) | (legal_mode << 60)
+}
+
 impl Cpu64 {
     pub fn execute(&mut self, inst: u32, bus: &mut impl Bus) -> Result<(), Trap64> {
         let d = DecodedInst::decode(inst);
@@ -525,12 +548,18 @@ impl Cpu64 {
                         .ok_or(Trap64::IllegalInstruction(inst as u64))?,
                 };
 
-                let new_val = match d.funct3 & 0x3 {
+                let mut new_val = match d.funct3 & 0x3 {
                     0b01 => rs1_val,
                     0b10 => old_val | rs1_val,
                     0b11 => old_val & !rs1_val,
                     _ => old_val,
                 };
+                let mut requested_satp = None;
+
+                if csr_addr == CSR_SATP {
+                    requested_satp = Some(new_val);
+                    new_val = sanitize_satp(new_val);
+                }
 
                 if d.funct3 & 0x3 == 0b01 || rs1_val != 0 {
                     match csr_addr {
@@ -548,6 +577,21 @@ impl Cpu64 {
                         }
                         _ => {
                             if csr_addr == CSR_SATP && new_val != old_val {
+                                if std::env::var("RISCV_DEBUG").is_ok() {
+                                    if let Some(requested) = requested_satp {
+                                        if requested != new_val {
+                                            eprintln!(
+                                                "[CSR] satp clamp: pc={:#018x} old={:#018x} requested={:#018x} new={:#018x}",
+                                                self.pc, old_val, requested, new_val
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[CSR] satp write: pc={:#018x} old={:#018x} new={:#018x}",
+                                                self.pc, old_val, new_val
+                                            );
+                                        }
+                                    }
+                                }
                                 self.mmu.invalidate();
                             }
                             if !self.csr.write(csr_addr, new_val, self.priv_level) {

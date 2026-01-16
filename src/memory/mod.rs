@@ -361,6 +361,17 @@ impl Memory {
             0x22228293,           // addi t0, t0, 0x222
             0x30329073,           // csrw mideleg, t0
             
+            // === Enable interrupts in mie ===
+            // Enable M-mode timer (MTIE bit 7) and S-mode interrupts
+            // mie = 0xAAA (bits 1,3,5,7,9,11 = SSI,MSI,STI,MTI,SEI,MEI)
+            // To correctly load 0xAAA on RV64:
+            // lui t0, 1 -> t0 = 0x1000
+            // addi t0, t0, -0x556 -> t0 = 0x1000 + (-0x556) = 0x1000 - 1366 = 0xAAA
+            // Note: addi -0x556 = addi 0xAAA (in 12-bit two's complement, 0xAAA represents -1366)
+            0x000012b7,           // lui t0, 1            ; t0 = 0x1000
+            0xaaa28293,           // addi t0, t0, -0x556  ; t0 = 0x1000 - 0x556 = 0xAAA
+            0x30429073,           // csrw mie, t0
+            
             // === Setup mstatus for S-mode transition ===
             // Set MPP = Supervisor (01), MPIE = 1
             0x00000297,           // auipc t0, 0
@@ -390,9 +401,6 @@ impl Memory {
             0x30200073,           // mret
             
             // === Padding ===
-            0x00000013,           // nop
-            0x00000013,           // nop
-            0x00000013,           // nop
             0x00000013,           // nop
             0x00000013,           // nop
             0x00000013,           // nop

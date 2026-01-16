@@ -12,6 +12,7 @@ mod execute_fp;
 mod execute_c;
 pub mod mmu;
 pub mod trap;
+pub mod debug;
 
 pub use csr::Csr64;
 pub use mmu::Mmu64;
@@ -47,10 +48,15 @@ pub struct Cpu64 {
     // Debugging helpers
     pub last_write_addr: u64,
     pub last_write_val: u64,
+    #[serde(skip)]
+    pub exec_tracker: Option<debug::ExecutionTracker>,
+    #[serde(skip)]
+    pub int_tracker: Option<debug::InterruptTracker>,
 }
 
 impl Cpu64 {
     pub fn new() -> Self {
+        let enable_debug = std::env::var("RISCV_DEBUG_LOOP").is_ok();
         let mut cpu = Cpu64 {
             pc: 0x0000_0000_0000_1000,
             regs: [0u64; 32],
@@ -63,6 +69,8 @@ impl Cpu64 {
             mmu: Mmu64::new(),
             last_write_addr: 0,
             last_write_val: 0,
+            exec_tracker: if enable_debug { Some(debug::ExecutionTracker::new()) } else { None },
+            int_tracker: if enable_debug { Some(debug::InterruptTracker::new()) } else { None },
         };
         cpu.regs[0] = 0;
         cpu
@@ -85,6 +93,24 @@ impl Cpu64 {
         let mstatus = self.csr.mstatus;
         let priv_level = self.priv_level;
 
+        // Track execution for loop detection
+        if let Some(ref mut tracker) = self.exec_tracker {
+            tracker.track_pc(self.pc);
+            if tracker.should_print_status() {
+                eprintln!("\n[STATUS] {} instructions executed, unique PCs: {}", 
+                    tracker.get_instruction_count(),
+                    tracker.get_unique_pc_count());
+                eprintln!("[STATUS] Current PC: {:#018x}, priv: {:?}, satp mode: {}", 
+                    self.pc, priv_level, (satp >> 60) & 0xF);
+                eprintln!("[STATUS] mstatus={:#018x} mip={:#018x} mie={:#018x}",
+                    mstatus, self.csr.mip, self.csr.mie);
+            }
+        }
+
+        if let Some(ref mut int_tracker) = self.int_tracker {
+            int_tracker.on_instruction();
+        }
+
         let paddr = match self.mmu.translate(self.pc, mmu::AccessType::Instruction, priv_level, bus, satp, mstatus) {
             Ok(pa) => pa,
             Err(cause) => return Err(Trap64::from_cause(cause, self.pc)),
@@ -92,9 +118,13 @@ impl Cpu64 {
 
         let inst = self.read_inst(bus, paddr)?;
         
-        // Debug instruction execution in potential infinite loops
-        if std::env::var("RISCV_DEBUG").is_ok() && self.pc >= 0x800010fe && self.pc <= 0x80001110 {
-            eprintln!("[CPU] PC={:#018x} inst={:#010x}", self.pc, inst);
+        // Debug instruction execution (limited range to avoid flooding)
+        if std::env::var("RISCV_DEBUG").is_ok() {
+            // Show boot loop and early kernel execution
+            if (self.pc >= 0x800010fe && self.pc <= 0x80001110) ||
+               (self.pc >= 0x80a06650 && self.pc <= 0x80a06680) {
+                eprintln!("[CPU] PC={:#018x} inst={:#010x}", self.pc, inst);
+            }
         }
         
         if (inst & 0b11) != 0b11 {

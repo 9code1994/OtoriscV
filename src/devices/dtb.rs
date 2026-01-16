@@ -262,3 +262,118 @@ pub fn generate_fdt(ram_size_mb: u32, cmdline: &str, initrd: Option<(u32, u32)>)
 
     dtb.finish()
 }
+
+/// Generate the Device Tree Blob for RV64 emulator (QEMU virt-like layout)
+/// Addresses match system64.rs:
+/// - CLINT: 0x02000000
+/// - PLIC:  0x0C000000
+/// - UART:  0x10000000
+/// - VirtIO: 0x10001000
+pub fn generate_fdt_rv64(ram_size_mb: u32, cmdline: &str, initrd: Option<(u32, u32)>) -> Vec<u8> {
+    let mut dtb = DtbBuilder::new();
+    
+    // Root node
+    dtb.begin_node("");
+    dtb.property_u32("#address-cells", 2);
+    dtb.property_u32("#size-cells", 2);
+    dtb.property_string("compatible", "riscv-virtio");
+    dtb.property_string("model", "riscv-virtio,qemu");
+
+    // /chosen
+    dtb.begin_node("chosen");
+    dtb.property_string("bootargs", cmdline);
+    dtb.property_string("stdout-path", "/soc/serial@10000000");
+    
+    // Add initrd location if provided (64-bit addresses for RV64)
+    if let Some((start, end)) = initrd {
+        // RV64 uses 64-bit values
+        dtb.property_u64("linux,initrd-start", start as u64);
+        dtb.property_u64("linux,initrd-end", end as u64);
+    }
+    
+    dtb.end_node();
+    
+    // /cpus
+    dtb.begin_node("cpus");
+    dtb.property_u32("#address-cells", 1);
+    dtb.property_u32("#size-cells", 0);
+    dtb.property_u32("timebase-frequency", 10_000_000); // 10 MHz
+    
+        // /cpus/cpu@0
+        dtb.begin_node("cpu@0");
+        dtb.property_string("device_type", "cpu");
+        dtb.property_u32("reg", 0);
+        dtb.property_string("status", "okay");
+        dtb.property_string("compatible", "riscv");
+        dtb.property_string("riscv,isa", "rv64imafdc");
+        dtb.property_string("mmu-type", "riscv,sv39");
+        
+            // /cpus/cpu@0/interrupt-controller
+            dtb.begin_node("interrupt-controller");
+            dtb.property_u32("#interrupt-cells", 1);
+            dtb.property_null("interrupt-controller");
+            dtb.property_string("compatible", "riscv,cpu-intc");
+            dtb.property_u32("phandle", 1); // PHANDLE_CPU_INTC
+            dtb.end_node();
+            
+        dtb.end_node(); // cpu@0
+    dtb.end_node(); // cpus
+
+    // /memory
+    dtb.begin_node("memory@80000000");
+    dtb.property_string("device_type", "memory");
+    let ram_size = (ram_size_mb as u64) * 1024 * 1024;
+    dtb.property_array_u32("reg", &[0, 0x80000000, (ram_size >> 32) as u32, ram_size as u32]);
+    dtb.end_node();
+
+    // /soc
+    dtb.begin_node("soc");
+    dtb.property_u32("#address-cells", 2);
+    dtb.property_u32("#size-cells", 2);
+    dtb.property_string("compatible", "simple-bus");
+    dtb.property_null("ranges");
+    
+        // CLINT at 0x02000000 (matches system64.rs CLINT_BASE)
+        dtb.begin_node("clint@2000000");
+        dtb.property_string("compatible", "riscv,clint0");
+        // Format: &cpu_intc irq_num for each interrupt
+        // M-mode SW (3), M-mode Timer (7), S-mode SW (1), S-mode Timer (5)
+        dtb.property_array_u32("interrupts-extended", &[1, 3, 1, 7, 1, 1, 1, 5]); 
+        dtb.property_array_u32("reg", &[0, 0x02000000, 0, 0x10000]);
+        dtb.end_node();
+        
+        // PLIC at 0x0C000000 (matches system64.rs PLIC_BASE)
+        dtb.begin_node("plic@c000000");
+        dtb.property_string("compatible", "sifive,plic-1.0.0");
+        dtb.property_string("compatible", "riscv,plic0");
+        dtb.property_array_u32("interrupts-extended", &[1, 11, 1, 9]); 
+        dtb.property_array_u32("reg", &[0, 0x0c000000, 0, 0x4000000]);
+        dtb.property_u32("riscv,ndev", 96); 
+        dtb.property_u32("#interrupt-cells", 1);
+        dtb.property_null("interrupt-controller");
+        dtb.property_u32("phandle", 2); // PHANDLE_PLIC
+        dtb.end_node();
+        
+        // UART at 0x10000000 (matches system64.rs UART_BASE - QEMU virt layout)
+        dtb.begin_node("serial@10000000");
+        dtb.property_string("compatible", "ns16550a");
+        dtb.property_array_u32("reg", &[0, 0x10000000, 0, 0x100]);
+        dtb.property_u32("interrupts", 10);
+        dtb.property_u32("interrupt-parent", 2); // &plic
+        dtb.property_u32("clock-frequency", 3686400); 
+        dtb.end_node();
+        
+        // VirtIO at 0x10001000 (matches system64.rs VIRTIO_BASE)
+        dtb.begin_node("virtio_mmio@10001000");
+        dtb.property_string("compatible", "virtio,mmio");
+        dtb.property_array_u32("reg", &[0, 0x10001000, 0, 0x1000]);
+        dtb.property_u32("interrupts", 1);
+        dtb.property_u32("interrupt-parent", 2); // &plic
+        dtb.end_node();
+        
+    dtb.end_node(); // soc
+
+    dtb.end_node(); // root
+
+    dtb.finish()
+}

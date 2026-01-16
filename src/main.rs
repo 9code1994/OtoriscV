@@ -331,10 +331,19 @@ fn main() -> io::Result<()> {
         None
     };
     
-    let cmdline = if initrd_data.is_some() {
-        "lpj=10000 console=ttyS0 earlycon rdinit=/sbin/init"
+    // RV64 uses SBI earlycon (sbi_console_putchar), RV32 uses UART earlycon
+    let cmdline = if config.rv64 {
+        if initrd_data.is_some() {
+            "earlycon=sbi console=hvc0 rdinit=/sbin/init"
+        } else {
+            "earlycon=sbi console=hvc0 root=/dev/vda ro"
+        }
     } else {
-        "lpj=10000 console=ttyS0 earlycon root=/dev/vda ro"
+        if initrd_data.is_some() {
+            "lpj=10000 console=ttyS0 earlycon rdinit=/sbin/init"
+        } else {
+            "lpj=10000 console=ttyS0 earlycon root=/dev/vda ro"
+        }
     };
     
     // Dispatch between RV32 and RV64

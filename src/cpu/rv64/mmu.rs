@@ -1,4 +1,4 @@
-//! Sv39 MMU implementation
+//! Sv39/Sv48/Sv57 MMU implementation
 
 use crate::cpu::PrivilegeLevel;
 use crate::memory::Bus;
@@ -12,6 +12,28 @@ pub enum AccessType {
 }
 
 const TLB_SIZE: usize = 16;
+const PPN_MASK: u64 = (1u64 << 44) - 1;
+
+#[derive(Clone, Copy)]
+struct AddressMode {
+    levels: usize,
+    va_bits: u8,
+}
+
+impl AddressMode {
+    fn from_satp_mode(mode: u64) -> Option<Self> {
+        match mode {
+            8 => Some(AddressMode { levels: 3, va_bits: 39 }),
+            9 => Some(AddressMode { levels: 4, va_bits: 48 }),
+            10 => Some(AddressMode { levels: 5, va_bits: 57 }),
+            _ => None,
+        }
+    }
+
+    fn page_shift_for_level(level: usize) -> u8 {
+        12 + (level as u8) * 9
+    }
+}
 
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -41,6 +63,7 @@ pub struct Mmu64 {
     tlb_generation: u32,
     tlb_hits: u64,
     tlb_misses: u64,
+    last_satp_mode: u64,
 }
 
 impl Mmu64 {
@@ -50,6 +73,7 @@ impl Mmu64 {
             tlb_generation: 1,
             tlb_hits: 0,
             tlb_misses: 0,
+            last_satp_mode: 0,
         }
     }
 
@@ -58,6 +82,7 @@ impl Mmu64 {
         self.tlb_generation = 1;
         self.tlb_hits = 0;
         self.tlb_misses = 0;
+        self.last_satp_mode = 0;
     }
 
     pub fn invalidate(&mut self) {
@@ -71,40 +96,52 @@ impl Mmu64 {
     pub fn translate(&mut self, vaddr: u64, access_type: AccessType, priv_level: PrivilegeLevel, bus: &mut impl Bus, satp: u64, mstatus: u64) -> Result<u64, u64> {
         let mode = (satp >> 60) & 0xF;
         
-        // Debug page faults
-        if std::env::var("RISCV_DEBUG").is_ok() && access_type == AccessType::Instruction {
-            eprintln!("[MMU] translate: vaddr={:#018x} priv={:?} satp={:#018x} mode={}", 
-                      vaddr, priv_level, satp, mode);
+        // Debug mode transitions
+        if std::env::var("RISCV_DEBUG").is_ok() && mode != self.last_satp_mode {
+            eprintln!("[MMU] Mode change: {} -> {} (satp={:#018x}, PC context)", 
+                      self.last_satp_mode, mode, satp);
+            self.last_satp_mode = mode;
         }
         
+        // Bare addressing (no translation)
         if priv_level == PrivilegeLevel::Machine || mode == 0 {
             return Ok(vaddr);
         }
-        if mode != 8 {
-            eprintln!("[MMU ERROR] Invalid satp mode: {} (expected 0 or 8)", mode);
-            return Err(self.page_fault_cause(access_type));
+        
+        // Debug actual page table walks
+        if std::env::var("RISCV_DEBUG").is_ok() {
+            eprintln!("[MMU] translate: vaddr={:#018x} priv={:?} satp={:#018x} mode={}", 
+                      vaddr, priv_level, satp, mode);
         }
 
-        if !self.is_canonical(vaddr) {
+        let addr_mode = match AddressMode::from_satp_mode(mode) {
+            Some(addr_mode) => addr_mode,
+            None => {
+                eprintln!("[MMU ERROR] Invalid satp mode: {} (expected 0, 8, 9, or 10)", mode);
+                return Err(self.page_fault_cause(access_type));
+            }
+        };
+
+        if !self.is_canonical(vaddr, addr_mode.va_bits) {
             eprintln!("[MMU ERROR] Non-canonical address: {:#018x}", vaddr);
             return Err(self.page_fault_cause(access_type));
         }
 
-        if let Some(paddr) = self.tlb_lookup(vaddr, access_type, priv_level, mstatus) {
+        if let Some(paddr) = self.tlb_lookup(vaddr, access_type, priv_level, mstatus, addr_mode.levels) {
             return Ok(paddr);
         }
 
-        // Sv39 page walk
-        let ppn = satp & 0x0000_FFFF_FFFF_FFFF;
+        // Sv39/Sv48/Sv57 page walk
+        let ppn = satp & PPN_MASK;
         let root = ppn << 12;
 
-        let vpn = [
-            (vaddr >> 12) & 0x1FF,
-            (vaddr >> 21) & 0x1FF,
-            (vaddr >> 30) & 0x1FF,
-        ];
+        let mut vpn = [0u64; 5];
+        for level in 0..addr_mode.levels {
+            let shift = 12 + (level as u64) * 9;
+            vpn[level] = (vaddr >> shift) & 0x1FF;
+        }
 
-        let mut level: i32 = 2;
+        let mut level: i32 = (addr_mode.levels as i32) - 1;
         let mut table = root;
 
         loop {
@@ -123,19 +160,16 @@ impl Mmu64 {
             if r == 1 || x == 1 {
                 self.check_permissions(pte, access_type, priv_level, mstatus)?;
 
-                let ppn_all = (pte >> 10) & 0x000F_FFFF_FFFF;
-                let page_shift = match level {
-                    2 => 30,
-                    1 => 21,
-                    _ => 12,
-                };
+                let ppn_all = (pte >> 10) & PPN_MASK;
+                let page_shift = AddressMode::page_shift_for_level(level as usize) as u64;
 
                 // Superpage alignment checks
-                if level == 2 && (ppn_all & 0x3FFFF) != 0 {
-                    return Err(self.page_fault_cause(access_type));
-                }
-                if level == 1 && (ppn_all & 0x1FF) != 0 {
-                    return Err(self.page_fault_cause(access_type));
+                let lower_ppn_bits = 9 * (level as u64);
+                if lower_ppn_bits > 0 {
+                    let mask = (1u64 << lower_ppn_bits) - 1;
+                    if (ppn_all & mask) != 0 {
+                        return Err(self.page_fault_cause(access_type));
+                    }
                 }
 
                 let paddr = (ppn_all << 12) | (vaddr & ((1u64 << page_shift) - 1));
@@ -146,7 +180,7 @@ impl Mmu64 {
 
                 let perm = ((r as u8) << 0) | ((w as u8) << 1) | ((x as u8) << 2) | ((u as u8) << 3);
                 let tag = vaddr >> page_shift;
-                self.fill_tlb(tag, ppn_all >> (page_shift - 12), perm, page_shift as u8);
+                self.fill_tlb(tag, ppn_all, perm, page_shift as u8);
 
                 return Ok(paddr);
             }
@@ -156,7 +190,7 @@ impl Mmu64 {
                 return Err(self.page_fault_cause(access_type));
             }
 
-            let next_ppn = (pte >> 10) & 0x000F_FFFF_FFFF;
+            let next_ppn = (pte >> 10) & PPN_MASK;
             table = next_ppn << 12;
         }
     }
@@ -176,18 +210,20 @@ impl Mmu64 {
         Ok(())
     }
 
-    fn is_canonical(&self, vaddr: u64) -> bool {
-        let sign = (vaddr >> 38) & 1;
-        let upper = vaddr >> 39;
+    fn is_canonical(&self, vaddr: u64, va_bits: u8) -> bool {
+        let sign = (vaddr >> (va_bits - 1)) & 1;
+        let upper = vaddr >> va_bits;
         if sign == 0 {
             upper == 0
         } else {
-            upper == 0x1FFFFFF
+            let upper_bits = 64 - va_bits as u64;
+            upper == ((1u64 << upper_bits) - 1)
         }
     }
 
-    fn tlb_lookup(&mut self, vaddr: u64, access_type: AccessType, priv_level: PrivilegeLevel, mstatus: u64) -> Option<u64> {
-        for &page_shift in &[12u8, 21u8, 30u8] {
+    fn tlb_lookup(&mut self, vaddr: u64, access_type: AccessType, priv_level: PrivilegeLevel, mstatus: u64, levels: usize) -> Option<u64> {
+        for level in 0..levels {
+            let page_shift = AddressMode::page_shift_for_level(level);
             let tag = vaddr >> page_shift;
             let idx = (tag as usize) & (TLB_SIZE - 1);
             if let Some(paddr) = self.tlb_match(idx, tag, page_shift, vaddr, access_type, priv_level, mstatus) {
