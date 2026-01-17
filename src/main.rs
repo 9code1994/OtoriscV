@@ -76,7 +76,17 @@ struct BenchmarkResult {
 
 fn output_has_prompt(buffer: &[u8]) -> bool {
     const PROMPTS: [&[u8]; 4] = [b"\n# ", b"\n$ ", b"\n~ $", b"\n~# "];
-    PROMPTS.iter().any(|pat| buffer.windows(pat.len()).any(|w| w == *pat))
+    if PROMPTS.iter().any(|pat| buffer.windows(pat.len()).any(|w| w == *pat)) {
+        return true;
+    }
+
+    let last_break = buffer
+        .iter()
+        .rposition(|&b| b == b'\n' || b == b'\r')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let line = &buffer[last_break..];
+    line.ends_with(b"# ") || line.ends_with(b"$ ")
 }
 
 fn run_emulator(system: &mut System, config: &BenchmarkConfig) -> io::Result<BenchmarkResult> {

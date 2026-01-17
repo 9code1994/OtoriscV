@@ -8,7 +8,7 @@
 
 ## ✨ Features
 
--   **RV32IMA** Support. (RV64GC WIP)
+-   **RV32IMA** & **RV64GC** Support.
 -   **Linux Bootable**: Runs modern kernels (v6.6+).
 -   **VirtIO-9P Filesystem**: Mount host directories directly in the guest when running as cli.
 -   **Optimized Performance**: Features XOR-based TLB caching, direct memory access paths, batched timer updates, basic block JIT, and an experimental Page-based JIT v2 with CFG optimization. (Inspired by Jor1k and v86)
@@ -93,11 +93,11 @@ We are planning to add Buildroot scripts in `buildroot-config/` to automate the 
 ---
 
 ## 📜 Documentation
-For a deeper dive into the technical internals, check the `docs/` folder:
+The implementation plans and debugging journeys, check the `docs/` folder:
 -   `uart_debugging_journey.md`: Reflections when couldn't boot Linux at first.
 -   `jor1k_optimization_analysis.md`: Comparison with the jor1k emulator.
--   `performance_upgrade_plan.md`: The plan before implementing optimizations.
--   `jit_v2_debugging_journey.md`: Reflections on the JIT v2 implementation.
+-   `performance_upgrade_plan.md`: The plan before implementing optimizations for RV32.
+-   `jit_v2_debugging_journey.md`: JIT v2 implementation that couldn't work at first.
 -   `rv64gc_upgrade_plan.md`: The plan for RV64GC support.
 
 ---
